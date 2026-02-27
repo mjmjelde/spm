@@ -1,0 +1,11 @@
+# Invalid: package.name is empty
+package:
+  name: ""
+  version: "1.0.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+
+content:
+  source_dir: /tmp/src

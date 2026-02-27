@@ -1,0 +1,90 @@
+# Full MATLAB example config — all fields populated
+package:
+  name: matlab
+  version: "2025a"
+  release: "1"
+  arch: x86_64
+  license: Proprietary
+  maintainer: "HPC Team <hpc-help@tamu.edu>"
+  description: "MATLAB R2025a - Technical Computing Environment"
+  url: https://www.mathworks.com/products/matlab.html
+  vendor: MathWorks
+
+  dependencies:
+    requires:
+      - libX11
+      - libXext
+      - "libasound2 >= 1.1"
+      - libgtk-3-0
+    requires_rpm:
+      - mesa-libGL
+    requires_deb:
+      - libgl1-mesa-glx
+    conflicts: []
+    provides:
+      - "matlab = 2025a"
+    replaces: []
+
+content:
+  source_dir: /opt/matlab-staging/R2025a
+
+  files:
+    - src: "/opt/matlab-staging/R2025a/**"
+      dst: /opt/matlab/R2025a/
+
+    - src: matlab.desktop
+      dst: /usr/share/applications/matlab-2025a.desktop
+      mode: "0644"
+
+    - src: matlab.sh
+      dst: /etc/profile.d/matlab-2025a.sh
+      type: config
+
+  symlinks: []
+
+  alternatives:
+    - name: matlab
+      link: /usr/bin/matlab
+      path: /opt/matlab/R2025a/bin/matlab
+      priority: 2025
+      followers:
+        - name: mex
+          link: /usr/bin/mex
+          path: /opt/matlab/R2025a/bin/mex
+        - name: matlab-help
+          link: /usr/bin/matlab-help
+          path: /opt/matlab/R2025a/bin/matlab-help
+
+  directories:
+    - path: /var/log/matlab
+      mode: "0750"
+      user: root
+      group: matlab
+
+scripts:
+  pre_install: scripts/preinst.sh
+  post_install: scripts/postinst.sh
+  pre_remove: scripts/prerm.sh
+  post_remove: scripts/postrm.sh
+
+compression:
+  algorithm: zstd
+  level: 19
+  threads: 0
+
+splitting:
+  enabled: true
+  strategy: auto
+
+signing:
+  key_file: ${SPM_SIGNING_KEY}
+
+rpm:
+  group: Development/Tools
+  payload_format: cpio
+
+deb:
+  section: science
+  priority: optional
+  fields:
+    Bugs: https://hpc.tamu.edu/bugs

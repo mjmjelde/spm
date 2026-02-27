@@ -1,0 +1,14 @@
+# Minimal valid spm config for testing
+package:
+  name: testpkg
+  version: "1.0.0"
+  arch: x86_64
+  license: MIT
+  maintainer: "Test User <test@example.com>"
+  description: "A minimal test package"
+
+content:
+  source_dir: /tmp/test-pkg
+  files:
+    - src: "/tmp/test-pkg/**"
+      dst: /opt/testpkg/

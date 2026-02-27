@@ -1,0 +1,11 @@
+# Invalid: unsupported architecture
+package:
+  name: badarch
+  version: "1.0.0"
+  arch: sparc64
+  license: MIT
+  maintainer: test
+  description: test
+
+content:
+  source_dir: /tmp/src
