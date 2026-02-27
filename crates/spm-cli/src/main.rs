@@ -42,7 +42,7 @@ enum Commands {
 
     /// Build package(s) from config
     Build {
-        /// Output format: rpm
+        /// Output format: rpm, deb
         #[arg(short, long, default_value = "rpm")]
         format: String,
 
@@ -204,11 +204,12 @@ fn cmd_build(config_path: &Path, format: &str, output_dir: &Path) -> Result<()> 
     let config = Config::load(config_path)
         .with_context(|| format!("failed to load config from '{}'", config_path.display()))?;
 
-    if format != "rpm" {
-        anyhow::bail!("only 'rpm' format is supported in this version, got '{format}'");
-    }
+    let limits = match format {
+        "rpm" => FormatLimits::rpm(),
+        "deb" => FormatLimits::deb(),
+        other => anyhow::bail!("unsupported format '{other}', expected 'rpm' or 'deb'"),
+    };
 
-    let limits = FormatLimits::rpm();
     let plan = Planner::plan(&config, &limits).with_context(|| "failed to create package plan")?;
 
     // Create output directory if needed.
@@ -219,18 +220,39 @@ fn cmd_build(config_path: &Path, format: &str, output_dir: &Path) -> Result<()> 
         )
     })?;
 
-    // Build each sub-package.
-    for sub_pkg in &plan.sub_packages {
-        let filename =
-            PackageFileName::rpm(&sub_pkg.name, &plan.version, &plan.release, &plan.arch);
-        let output_path = output_dir.join(&filename);
+    match format {
+        "rpm" => {
+            for sub_pkg in &plan.sub_packages {
+                let filename = PackageFileName::rpm(
+                    &sub_pkg.name,
+                    &plan.version,
+                    &plan.release,
+                    &plan.arch,
+                );
+                let output_path = output_dir.join(&filename);
 
-        println!("Building {filename}...");
+                println!("Building {filename}...");
 
-        spm_rpm::builder::RpmBuilder::build(sub_pkg, &plan, &config, &output_path)
-            .with_context(|| format!("failed to build RPM '{filename}'"))?;
+                spm_rpm::builder::RpmBuilder::build(sub_pkg, &plan, &config, &output_path)
+                    .with_context(|| format!("failed to build RPM '{filename}'"))?;
 
-        println!("  -> {}", output_path.display());
+                println!("  -> {}", output_path.display());
+            }
+        }
+        "deb" => {
+            let output_paths =
+                spm_deb::builder::DebBuilder::build(&plan, &config, output_dir)
+                    .with_context(|| "failed to build DEB packages")?;
+            for path in &output_paths {
+                let filename = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                println!("Building {filename}...");
+                println!("  -> {}", path.display());
+            }
+        }
+        _ => unreachable!(),
     }
 
     println!("Done.");

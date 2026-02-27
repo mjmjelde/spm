@@ -4,6 +4,7 @@ members = [
     "crates/spm-compress",
     "crates/spm-core",
     "crates/spm-cpio",
+    "crates/spm-deb",
     "crates/spm-rpm",
 ]
 resolver = "2"

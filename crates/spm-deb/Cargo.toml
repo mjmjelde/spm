@@ -1,0 +1,18 @@
+[package]
+name = "spm-deb"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "DEB package builder for spm"
+
+[dependencies]
+spm-core = { path = "../spm-core" }
+spm-compress = { path = "../spm-compress" }
+tar = "0.4"
+md-5 = "0.10"
+thiserror = "2"
+tempfile = "3"
+
+[dev-dependencies]
+flate2 = "1"
+zstd = "0.13"
