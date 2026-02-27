@@ -30,3 +30,39 @@
 - `Algorithm` enum with `from_str()`, `extension()`, `rpm_tag()`, `estimated_ratio()` methods
 - Auto-detect thread count via `num_cpus` when `threads = 0`
 - 12 unit tests + 1 doc-test
+
+### Phase 3: CPIO Writer & RPM Backend
+
+- Created `spm-cpio` crate with Newc (`070701`) and Extended (`07070X`) CPIO format writers
+- Created `spm-rpm` crate with full RPM v4 package builder
+- Implemented RPM lead (96 bytes), header builder (sorted tags, alignment, network byte order),
+  signature header (MD5, SHA-256, payload size), and metadata header (package, file, dependency,
+  script tags)
+- Build pipeline: file digests → cpio|compress → temp file → header → signature → assemble
+- Supports hardlink convention (all-but-last size=0, last carries data)
+- Extended CPIO auto-selected when any file exceeds 4 GiB standard limit
+- Added `spm build --format rpm` to CLI
+- Validated with `rpm -qpl`, `rpm -qi -p`, `rpm -K`, and `rpm -ivh` on Fedora 40 container
+- 48 unit tests across spm-cpio (13) and spm-rpm (35)
+
+### Phase 4: DEB Backend & Auto-Split
+
+- Created `spm-deb` crate with ar archive writer, control file generation, and DEB build pipeline
+- Implemented `ArWriter<W>` with in-memory and streaming APIs, 60-byte member headers,
+  even-byte padding
+- Implemented control file generation: Package, Version, Architecture, Maintainer, Installed-Size,
+  Section, Priority, Depends (common + deb-specific + extra), Conflicts, Provides, Replaces,
+  Homepage, Description, custom fields from `DebOverrides.fields`
+- Implemented md5sums generation for all regular files
+- Implemented conffiles detection for `is_config` entries
+- Implemented data.tar generation using `tar` crate with GNU format, compressed via spm-compress
+- Implemented control.tar generation with control, md5sums, conffiles, and scripts
+  (preinst, postinst, prerm, postrm)
+- DEB assembly: `debian-binary` ("2.0\n") + `control.tar.{zst,gz}` + `data.tar.{zst,gz}` in ar
+- Auto-split: meta-package with `Depends:` on all parts (version-pinned), each part as separate DEB
+- DEB-specific compression override via `deb.compression` config field
+- Reproducible builds: `source_date_epoch` applied to ar headers, tar entries, control metadata
+- Added `spm build --format deb` to CLI with `FormatLimits::deb()` planning
+- Validated with `dpkg-deb -I`, `dpkg-deb -c`, `dpkg -i`, `dpkg -r`, `dpkg --purge` on
+  Ubuntu 24.04 container — scripts, conffiles, dependencies, metadata all verified
+- 48 unit tests (ar: 12, control: 16, builder: 20)
