@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/spm-cli",
+    "crates/spm-compress",
     "crates/spm-core",
 ]
 resolver = "2"

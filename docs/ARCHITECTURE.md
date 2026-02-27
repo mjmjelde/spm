@@ -8,6 +8,8 @@ spm/
 ├── crates/
 │   ├── spm-cli/                # Binary crate — CLI frontend
 │   │   └── src/main.rs         # clap CLI with validate/init/plan subcommands
+│   ├── spm-compress/           # Streaming compression abstraction
+│   │   └── src/lib.rs          # Algorithm, CompressorConfig, compress_writer()
 │   └── spm-core/               # Config parsing, planning, shared types
 │       └── src/
 │           ├── lib.rs           # Re-exports modules
@@ -25,6 +27,7 @@ spm/
 
 ```
 spm-cli ──► spm-core
+spm-compress  (standalone, no spm-core dependency)
 ```
 
 ## Key Types
@@ -62,6 +65,13 @@ spm-cli ──► spm-core
 - `generate_install_scriptlet()` — Generates `update-alternatives --install` with follower support.
 - `generate_remove_scriptlet()` — Generates guarded `update-alternatives --remove`.
 - `resolve_scripts()` — Loads user scripts, injects alternatives scriptlets.
+
+### spm-compress
+
+- `Algorithm` — `Zstd`, `Gzip`, `Xz`, `None`. Methods: `from_str()`, `extension()`, `rpm_tag()`, `estimated_ratio()`.
+- `CompressorConfig` — Algorithm, level, thread count. Resolves defaults via `effective_level()` and `effective_threads()`.
+- `compress_writer()` — Creates a `Box<dyn Write>` that compresses data written to it. Supports zstd (multi-threaded), gzip, none (passthrough). Xz stubbed.
+- `CompressError` — `Io`, `Unsupported`.
 
 ### spm-cli
 

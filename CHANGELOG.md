@@ -21,3 +21,12 @@
 - Added `spm plan` subcommand with `--format rpm|deb` flag
 - Added `walkdir` and `glob` dependencies for file system traversal
 - 62 unit tests across all new modules
+
+### Phase 2: Compression Engine
+
+- Created `spm-compress` crate with streaming compression abstraction
+- Implemented `compress_writer()` for zstd (multi-threaded), gzip, and none (passthrough)
+- Stubbed xz support (returns `Unsupported` error, deferred to Phase 5)
+- `Algorithm` enum with `from_str()`, `extension()`, `rpm_tag()`, `estimated_ratio()` methods
+- Auto-detect thread count via `num_cpus` when `threads = 0`
+- 12 unit tests + 1 doc-test
