@@ -40,6 +40,17 @@ enum Commands {
         format: String,
     },
 
+    /// Build package(s) from config
+    Build {
+        /// Output format: rpm
+        #[arg(short, long, default_value = "rpm")]
+        format: String,
+
+        /// Output directory
+        #[arg(short, long, default_value = "./out")]
+        output: PathBuf,
+    },
+
     /// Create a template spm.yaml
     Init {
         /// Package name
@@ -58,6 +69,10 @@ fn main() {
     let result = match cli.command {
         Commands::Validate => cmd_validate(&cli.config),
         Commands::Plan { ref format } => cmd_plan(&cli.config, format),
+        Commands::Build {
+            ref format,
+            ref output,
+        } => cmd_build(&cli.config, format, output),
         Commands::Init { name, version } => cmd_init(&name, &version),
     };
 
@@ -181,6 +196,44 @@ fn cmd_plan(config_path: &Path, format: &str) -> Result<()> {
     println!();
     println!("  Output: out/{output_filename}");
 
+    Ok(())
+}
+
+/// Build packages from config.
+fn cmd_build(config_path: &Path, format: &str, output_dir: &Path) -> Result<()> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("failed to load config from '{}'", config_path.display()))?;
+
+    if format != "rpm" {
+        anyhow::bail!("only 'rpm' format is supported in this version, got '{format}'");
+    }
+
+    let limits = FormatLimits::rpm();
+    let plan = Planner::plan(&config, &limits).with_context(|| "failed to create package plan")?;
+
+    // Create output directory if needed.
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "failed to create output directory '{}'",
+            output_dir.display()
+        )
+    })?;
+
+    // Build each sub-package.
+    for sub_pkg in &plan.sub_packages {
+        let filename =
+            PackageFileName::rpm(&sub_pkg.name, &plan.version, &plan.release, &plan.arch);
+        let output_path = output_dir.join(&filename);
+
+        println!("Building {filename}...");
+
+        spm_rpm::builder::RpmBuilder::build(sub_pkg, &plan, &config, &output_path)
+            .with_context(|| format!("failed to build RPM '{filename}'"))?;
+
+        println!("  -> {}", output_path.display());
+    }
+
+    println!("Done.");
     Ok(())
 }
 

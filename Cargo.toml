@@ -3,6 +3,8 @@ members = [
     "crates/spm-cli",
     "crates/spm-compress",
     "crates/spm-core",
+    "crates/spm-cpio",
+    "crates/spm-rpm",
 ]
 resolver = "2"
 

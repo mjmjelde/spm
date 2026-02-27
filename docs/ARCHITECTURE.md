@@ -7,18 +7,29 @@ spm/
 ├── Cargo.toml                  # Workspace root
 ├── crates/
 │   ├── spm-cli/                # Binary crate — CLI frontend
-│   │   └── src/main.rs         # clap CLI with validate/init/plan subcommands
+│   │   └── src/main.rs         # clap CLI with validate/init/plan/build subcommands
 │   ├── spm-compress/           # Streaming compression abstraction
 │   │   └── src/lib.rs          # Algorithm, CompressorConfig, compress_writer()
-│   └── spm-core/               # Config parsing, planning, shared types
+│   ├── spm-core/               # Config parsing, planning, shared types
+│   │   └── src/
+│   │       ├── lib.rs           # Re-exports modules
+│   │       ├── config.rs        # YAML deserialization & validation
+│   │       ├── error.rs         # Error types (ConfigError, FileTreeError, PlanError)
+│   │       ├── types.rs         # FormatLimits, parse_size, format_size, PackageFileName
+│   │       ├── filetree.rs      # File tree walking, glob expansion, hardlink detection
+│   │       ├── planner.rs       # Package planning, split strategies, meta-package generation
+│   │       └── alternatives.rs  # update-alternatives scriptlet generation
+│   ├── spm-cpio/               # CPIO archive writer (Newc + Extended)
+│   │   └── src/lib.rs          # CpioWriter, CpioFormat, CpioMetadata
+│   └── spm-rpm/                # RPM v4 package builder
 │       └── src/
 │           ├── lib.rs           # Re-exports modules
-│           ├── config.rs        # YAML deserialization & validation
-│           ├── error.rs         # Error types (ConfigError, FileTreeError, PlanError)
-│           ├── types.rs         # FormatLimits, parse_size, format_size, PackageFileName
-│           ├── filetree.rs      # File tree walking, glob expansion, hardlink detection
-│           ├── planner.rs       # Package planning, split strategies, meta-package generation
-│           └── alternatives.rs  # update-alternatives scriptlet generation
+│           ├── error.rs         # RpmError (Io, Cpio, Compress, SourceFile, Header)
+│           ├── lead.rs          # 96-byte RPM lead writer
+│           ├── tags.rs          # All RPM tag constants and flag definitions
+│           ├── header.rs        # HeaderBuilder — RPM header binary format
+│           ├── signature.rs     # Signature header (MD5, SHA-1, SHA-256, sizes)
+│           └── builder.rs       # RpmBuilder — full RPM build pipeline
 └── tests/
     └── fixtures/               # Test YAML configs
 ```
@@ -27,7 +38,11 @@ spm/
 
 ```
 spm-cli ──► spm-core
+        └─► spm-rpm ──► spm-core
+                    └─► spm-cpio
+                    └─► spm-compress
 spm-compress  (standalone, no spm-core dependency)
+spm-cpio      (standalone, only depends on thiserror)
 ```
 
 ## Key Types
@@ -73,6 +88,22 @@ spm-compress  (standalone, no spm-core dependency)
 - `compress_writer()` — Creates a `Box<dyn Write>` that compresses data written to it. Supports zstd (multi-threaded), gzip, none (passthrough). Xz stubbed.
 - `CompressError` — `Io`, `Unsupported`.
 
+### spm-cpio
+
+- `CpioFormat` — `Newc` (070701, standard), `Extended` (07070X, RPM-specific for >4GiB files).
+- `CpioWriter<W: Write>` — Sequential archive writer. `write_entry()` writes header + data, `finish()` writes trailer and returns `(W, u64)`.
+- `CpioMetadata` — Per-entry metadata: ino, mode, uid, gid, nlink, mtime, filesize, devmajor/minor, rdevmajor/minor.
+- `CpioError` — `Io`, `FileTooLarge` (Newc format, >4GiB).
+
+### spm-rpm
+
+- `RpmBuilder::build()` — Full RPM build pipeline: file digests → CPIO payload → metadata header → signature header → assembly.
+- `HeaderBuilder` — Builds RPM header binary format with proper alignment and tag-sorted data ordering. Supports region tags.
+- `build_signature()` — Creates signature header with MD5, SHA-1, SHA-256, and size tags.
+- `write_lead()` — Writes the 96-byte RPM lead structure.
+- `RpmError` — `Io`, `Cpio`, `Compress`, `SourceFile`, `Header`.
+
 ### spm-cli
 
-- `Cli` / `Commands` — clap-derived CLI structure with `validate`, `init`, and `plan` subcommands.
+- `Cli` / `Commands` — clap-derived CLI structure with `validate`, `init`, `plan`, and `build` subcommands.
+- `cmd_build()` — Loads config, creates package plan, builds RPM for each sub-package.
