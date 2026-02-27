@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use spm_core::config::Config;
+use spm_core::planner::{count_files, Planner, SubPackageRole};
+use spm_core::types::{format_size, FormatLimits, PackageFileName};
 
 /// spm — Large-file-aware Linux package builder
 #[derive(Parser)]
@@ -31,6 +33,13 @@ enum Commands {
     /// Validate a spm.yaml without building
     Validate,
 
+    /// Show what would be built (dry run)
+    Plan {
+        /// Output format: rpm, deb
+        #[arg(short, long, default_value = "rpm")]
+        format: String,
+    },
+
     /// Create a template spm.yaml
     Init {
         /// Package name
@@ -48,6 +57,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Validate => cmd_validate(&cli.config),
+        Commands::Plan { ref format } => cmd_plan(&cli.config, format),
         Commands::Init { name, version } => cmd_init(&name, &version),
     };
 
@@ -68,6 +78,123 @@ fn cmd_validate(config_path: &Path) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Run the planner and print a summary of what would be built.
+fn cmd_plan(config_path: &Path, format: &str) -> Result<()> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("failed to load config from '{}'", config_path.display()))?;
+
+    let limits = match format {
+        "rpm" => FormatLimits::rpm(),
+        "deb" => FormatLimits::deb(),
+        other => anyhow::bail!("unsupported format '{}', expected 'rpm' or 'deb'", other),
+    };
+
+    let plan = Planner::plan(&config, &limits).with_context(|| "failed to create package plan")?;
+
+    // Print plan summary.
+    let output_filename = match format {
+        "rpm" => PackageFileName::rpm(&plan.name, &plan.version, &plan.release, &plan.arch),
+        "deb" => PackageFileName::deb(&plan.name, &plan.version, &plan.release, &plan.arch),
+        _ => unreachable!(),
+    };
+
+    // Count total files (non-directory entries).
+    let total_files: usize = plan
+        .sub_packages
+        .iter()
+        .map(|sp| count_files(&sp.files))
+        .sum();
+
+    println!("Package: {output_filename}");
+    println!("  Source: {}", config.content.source_dir.display());
+    println!("  Files: {}", format_file_count(total_files));
+    println!("  Uncompressed: {}", format_size(plan.total_size));
+
+    // Estimated compressed size.
+    let ratio = spm_core::types::estimated_compression_ratio(&config.compression.algorithm);
+    let estimated_compressed = (plan.total_size as f64 * ratio) as u64;
+    let level_str = config
+        .compression
+        .level
+        .map(|l| format!(" -{l}"))
+        .unwrap_or_default();
+    println!(
+        "  Estimated compressed ({}{level_str}): ~{}",
+        config.compression.algorithm,
+        format_size(estimated_compressed)
+    );
+    println!();
+
+    // RPM-specific: cpio format.
+    if format == "rpm" {
+        if plan.needs_extended_cpio {
+            println!("  RPM payload format: 07070X (extended cpio, files > 4 GiB detected)");
+        } else {
+            println!("  RPM payload format: 070701 (standard cpio)");
+        }
+    }
+
+    // Splitting info.
+    if plan.is_split {
+        println!("  Splitting: REQUIRED");
+        println!("  Split plan:");
+        for sp in &plan.sub_packages {
+            match &sp.role {
+                SubPackageRole::Meta => {
+                    let meta_filename = match format {
+                        "rpm" => {
+                            PackageFileName::rpm(&sp.name, &plan.version, &plan.release, &plan.arch)
+                        }
+                        "deb" => {
+                            PackageFileName::deb(&sp.name, &plan.version, &plan.release, &plan.arch)
+                        }
+                        _ => unreachable!(),
+                    };
+                    println!("    {meta_filename}  (meta-package)");
+                }
+                SubPackageRole::Part(_) => {
+                    let part_filename = match format {
+                        "rpm" => {
+                            PackageFileName::rpm(&sp.name, &plan.version, &plan.release, &plan.arch)
+                        }
+                        "deb" => {
+                            PackageFileName::deb(&sp.name, &plan.version, &plan.release, &plan.arch)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let file_count = count_files(&sp.files);
+                    println!(
+                        "    {part_filename}  (~{}, {} files)",
+                        format_size(sp.total_size),
+                        format_file_count(file_count)
+                    );
+                }
+                SubPackageRole::Standalone => {} // shouldn't happen in split
+            }
+        }
+    } else {
+        println!("  Splitting: NOT REQUIRED");
+    }
+
+    println!();
+    println!("  Output: out/{output_filename}");
+
+    Ok(())
+}
+
+/// Format a file count with comma separators.
+fn format_file_count(count: usize) -> String {
+    let s = count.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
 
 /// Write a template spm.yaml to the current directory.

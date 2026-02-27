@@ -20,12 +20,16 @@ spm init --name myapp --version 1.0.0
 
 # Validate a config file
 spm validate --config spm.yaml
+
+# Dry-run: show what would be built
+spm plan --config spm.yaml --format rpm
+spm plan --config spm.yaml --format deb
 ```
 
 ## Current Status
 
 - [x] Phase 0: Workspace scaffolding, config parsing, validation, CLI (`validate`, `init`)
-- [ ] Phase 1: File tree walking & package planning
+- [x] Phase 1: File tree walking & package planning (`plan`)
 - [ ] Phase 2: Compression engine
 - [ ] Phase 3: CPIO writer & RPM backend
 - [ ] Phase 4: DEB backend & auto-split

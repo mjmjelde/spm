@@ -10,3 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
 shellexpand = "3"
+walkdir = "2"
+glob = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

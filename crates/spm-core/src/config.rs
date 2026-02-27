@@ -99,6 +99,9 @@ pub struct DependencyConfig {
 pub struct ContentConfig {
     /// Root directory containing files to package.
     pub source_dir: PathBuf,
+    /// Global defaults applied to all files unless overridden per-mapping.
+    #[serde(default)]
+    pub defaults: ContentDefaults,
     /// File mapping rules (glob patterns, destinations, overrides).
     #[serde(default)]
     pub files: Vec<FileMapping>,
@@ -113,6 +116,43 @@ pub struct ContentConfig {
     pub alternatives: Vec<AlternativeConfig>,
 }
 
+/// Global defaults applied to all files unless overridden per-mapping.
+///
+/// Resolution order (first wins):
+/// 1. Per-mapping override (content.files[].user/group/mode/dir_mode)
+/// 2. Global defaults (content.defaults.user/group/file_mode/dir_mode)
+/// 3. Source file metadata on disk
+#[derive(Debug, Deserialize)]
+pub struct ContentDefaults {
+    /// Default owner for all entries.
+    #[serde(default = "default_root")]
+    pub user: String,
+    /// Default group for all entries.
+    #[serde(default = "default_root")]
+    pub group: String,
+    /// Default mode for regular files (e.g. "0644"). If None, preserve from source.
+    #[serde(default)]
+    pub file_mode: Option<String>,
+    /// Default mode for directories (e.g. "0755"). If None, preserve from source.
+    #[serde(default)]
+    pub dir_mode: Option<String>,
+}
+
+fn default_root() -> String {
+    "root".to_string()
+}
+
+impl Default for ContentDefaults {
+    fn default() -> Self {
+        Self {
+            user: default_root(),
+            group: default_root(),
+            file_mode: None,
+            dir_mode: None,
+        }
+    }
+}
+
 /// A single file mapping rule (source glob/path to destination).
 #[derive(Debug, Deserialize)]
 pub struct FileMapping {
@@ -120,9 +160,12 @@ pub struct FileMapping {
     pub src: String,
     /// Destination path inside the package.
     pub dst: String,
-    /// Optional file mode override (e.g. "0755").
+    /// Optional file mode override (applies to regular files matched).
     #[serde(default)]
     pub mode: Option<String>,
+    /// Optional directory mode override (applies to directories matched).
+    #[serde(default)]
+    pub dir_mode: Option<String>,
     /// Optional owner override.
     #[serde(default)]
     pub user: Option<String>,

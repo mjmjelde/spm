@@ -171,6 +171,8 @@ pub struct DependencyConfig {
 pub struct ContentConfig {
     pub source_dir: PathBuf,
     #[serde(default)]
+    pub defaults: ContentDefaults,
+    #[serde(default)]
     pub files: Vec<FileMapping>,
     #[serde(default)]
     pub symlinks: Vec<SymlinkMapping>,
@@ -180,18 +182,46 @@ pub struct ContentConfig {
     pub alternatives: Vec<AlternativeConfig>,
 }
 
+/// Global defaults applied to all files unless overridden per-mapping
+#[derive(Debug, Deserialize)]
+pub struct ContentDefaults {
+    #[serde(default = "default_root")]
+    pub user: String,
+    #[serde(default = "default_root")]
+    pub group: String,
+    #[serde(default)]
+    pub file_mode: Option<String>,    // e.g. "0644" — if None, preserve from source
+    #[serde(default)]
+    pub dir_mode: Option<String>,     // e.g. "0755" — if None, preserve from source
+}
+
+fn default_root() -> String { "root".to_string() }
+
+impl Default for ContentDefaults {
+    fn default() -> Self {
+        Self {
+            user: default_root(),
+            group: default_root(),
+            file_mode: None,
+            dir_mode: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FileMapping {
     pub src: String,        // glob pattern or path
     pub dst: String,        // destination path
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<String>,       // override file mode (applies to files matched)
     #[serde(default)]
-    pub user: Option<String>,
+    pub dir_mode: Option<String>,   // override dir mode (applies to dirs matched)
     #[serde(default)]
-    pub group: Option<String>,
+    pub user: Option<String>,       // override owner
     #[serde(default)]
-    pub r#type: Option<String>,  // "config", etc.
+    pub group: Option<String>,      // override group
+    #[serde(default)]
+    pub r#type: Option<String>,     // "config", etc.
 }
 
 #[derive(Debug, Deserialize)]
@@ -419,7 +449,15 @@ cargo test -p spm-core
 
 use std::path::PathBuf;
 
-/// Represents a single file/dir/symlink to include in the package
+/// Represents a single file/dir/symlink to include in the package.
+///
+/// Ownership and permissions are resolved in this order (first wins):
+///   1. Per-mapping override (content.files[].user/group/mode/dir_mode)
+///   2. Global defaults (content.defaults.user/group/file_mode/dir_mode)
+///   3. Source file metadata on disk (only if no defaults set and no override)
+///
+/// This means: if you build as "builduser" but set content.defaults.user = "root",
+/// all files in the package will be owned by root regardless of who owns them on disk.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     /// Path as it will appear inside the package (absolute, e.g. /opt/matlab/bin/matlab)
@@ -430,11 +468,11 @@ pub struct FileEntry {
     pub entry_type: EntryType,
     /// File size in bytes (0 for dirs/symlinks)
     pub size: u64,
-    /// Unix mode (e.g. 0o755)
+    /// Unix mode (e.g. 0o755) — resolved from override > defaults > source
     pub mode: u32,
-    /// Owner
+    /// Owner — resolved from override > defaults > source
     pub user: String,
-    /// Group
+    /// Group — resolved from override > defaults > source
     pub group: String,
     /// Whether this is a config file (noreplace/conffile)
     pub is_config: bool,
@@ -626,6 +664,44 @@ fn test_alternatives_scriptlet_generation() {
 fn test_alternatives_follower_syntax() {
     // Config with followers
     // Assert: --slave flags appear in generated scriptlet
+}
+
+#[test]
+fn test_ownership_global_defaults() {
+    // Config with content.defaults.user = "root", content.defaults.group = "appgroup"
+    // Source files on disk owned by "builduser:builduser"
+    // Assert: all FileEntry instances have user="root", group="appgroup"
+}
+
+#[test]
+fn test_ownership_per_mapping_override() {
+    // Config with content.defaults.user = "root"
+    // One file mapping with user = "nobody"
+    // Assert: files from that mapping have user="nobody"
+    // Assert: files from other mappings still have user="root"
+}
+
+#[test]
+fn test_ownership_dir_mode_vs_file_mode() {
+    // Config with content.defaults.file_mode = "0644", content.defaults.dir_mode = "0755"
+    // Source tree has mixed files and directories
+    // Assert: regular files get mode 0o644
+    // Assert: directories get mode 0o755
+}
+
+#[test]
+fn test_src_dst_path_stripping() {
+    // src: /tmp/build/output/**   dst: /opt/app/
+    // File at /tmp/build/output/bin/tool
+    // Assert: install_path == /opt/app/bin/tool
+    // (src prefix before glob is stripped, replaced with dst)
+}
+
+#[test]
+fn test_src_dst_literal_file() {
+    // src: /tmp/build/license.txt   dst: /opt/app/LICENSE
+    // Assert: install_path == /opt/app/LICENSE
+    // (direct 1:1 mapping, no stripping)
 }
 ```
 

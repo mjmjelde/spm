@@ -139,14 +139,30 @@ content:
   # Source directory to package
   source_dir: /opt/matlab-staging/R2025a
 
+  # Global defaults for all files (can be overridden per-mapping)
+  defaults:
+    user: root
+    group: root
+    dir_mode: "0755"
+    file_mode: "0644"
+
   # File mapping rules (applied in order, first match wins)
+  #
+  # How src → dst path mapping works:
+  #   src: /tmp/build/matlab/**    dst: /opt/matlab/
+  #   A file at /tmp/build/matlab/bin/matlab becomes /opt/matlab/bin/matlab
+  #   The src prefix before the glob is stripped and replaced with dst.
+  #
+  #   src: /tmp/build/matlab/license.txt    dst: /opt/matlab/license.txt
+  #   A literal file is mapped directly to dst.
+  #
   files:
     - src: "/opt/matlab-staging/R2025a/**"
       dst: /opt/matlab/R2025a/
-      # Optional overrides:
-      # mode: "0755"          # default: preserve from source
-      # user: root            # default: root
-      # group: root           # default: root
+      # Per-mapping overrides (these override the global defaults above):
+      # mode: "0755"          # override file mode for everything matched
+      # user: root            # override owner for everything matched
+      # group: root           # override group for everything matched
 
     - src: matlab.desktop
       dst: /usr/share/applications/matlab-2025a.desktop
@@ -155,6 +171,15 @@ content:
     - src: matlab.sh
       dst: /etc/profile.d/matlab-2025a.sh
       type: config           # marks as config file (noreplace for RPM, conffile for DEB)
+
+    # Example: software built in a staging area as non-root
+    # The build user owns everything, but the package should install as root:matlab
+    # Global defaults handle user/group, so you only need to specify src/dst:
+    #
+    # - src: "/home/builduser/matlab-build/output/**"
+    #   dst: /opt/matlab/R2025a/
+    #   group: matlab          # override just the group for this tree
+    #   dir_mode: "0750"       # directories get tighter perms
 
   symlinks:
     # Static symlinks — use sparingly. For multi-version binaries, use alternatives instead.
@@ -177,6 +202,68 @@ content:
           path: /opt/matlab/R2025a/bin/matlab-help
 
   directories:
+    - path: /var/log/matlab
+      mode: "0750"
+      user: root
+      group: matlab
+```
+
+### 3.2 File Ownership and Permission Resolution
+
+When building the package, spm resolves the ownership and permissions for each file using this precedence (first wins):
+
+1. **Per-mapping override** — `user`, `group`, `mode`, or `dir_mode` set on an individual `content.files[]` entry
+2. **Global defaults** — `content.defaults.user`, `group`, `file_mode`, `dir_mode`
+3. **Source file metadata** — the actual uid/gid/mode from disk (only used if no default is set and no override exists)
+
+This means you can build software anywhere, as any user, and control exactly what ownership ends up in the package:
+
+```yaml
+content:
+  # Everything defaults to root:root with standard permissions
+  defaults:
+    user: root
+    group: root
+    file_mode: "0644"
+    dir_mode: "0755"
+
+  files:
+    # Built by "builduser" in /tmp — doesn't matter, package installs as root:root
+    - src: "/tmp/matlab-build/output/**"
+      dst: /opt/matlab/R2025a/
+
+    # Binaries need to be executable — override just the file mode
+    - src: "/tmp/matlab-build/output/bin/**"
+      dst: /opt/matlab/R2025a/bin/
+      mode: "0755"
+
+    # Private data directory owned by a service group
+    - src: "/tmp/matlab-build/output/data/**"
+      dst: /opt/matlab/R2025a/data/
+      group: matlab
+      dir_mode: "0750"
+      mode: "0640"
+```
+
+**How `src` → `dst` path mapping works:**
+
+| `src` pattern | File on disk | `dst` | Result install path |
+|---------------|-------------|-------|-------------------|
+| `/tmp/build/**` | `/tmp/build/bin/tool` | `/opt/app/` | `/opt/app/bin/tool` |
+| `/tmp/build/**` | `/tmp/build/lib/libfoo.so` | `/opt/app/` | `/opt/app/lib/libfoo.so` |
+| `/tmp/build/license.txt` | `/tmp/build/license.txt` | `/opt/app/LICENSE` | `/opt/app/LICENSE` |
+
+For glob patterns, the prefix before the `**` is stripped and replaced with `dst`. For literal paths, it's a direct 1:1 mapping.
+
+**Per-mapping fields reference:**
+
+| Field | Applies to | Default |
+|-------|-----------|---------|
+| `mode` | Regular files matched by this mapping | `content.defaults.file_mode`, then source |
+| `dir_mode` | Directories matched by this mapping | `content.defaults.dir_mode`, then source |
+| `user` | All entries matched by this mapping | `content.defaults.user`, then source |
+| `group` | All entries matched by this mapping | `content.defaults.group`, then source |
+| `type` | Regular files (`"config"` for conffile/noreplace) | none |
     - path: /var/log/matlab
       mode: "0750"
       user: root
@@ -243,7 +330,7 @@ build:
   # source_date_epoch: ${SOURCE_DATE_EPOCH}
 ```
 
-### 3.2 Config Resolution Order
+### 3.3 Config Resolution Order
 
 1. `spm.yaml` in current directory (or `--config path`)
 2. CLI flags override any config file values
