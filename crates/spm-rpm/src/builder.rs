@@ -18,6 +18,8 @@ use spm_core::filetree::{EntryType, FileEntry};
 use spm_core::planner::{PackagePlan, SubPackage};
 use spm_cpio::{CpioFormat, CpioMetadata, CpioWriter};
 
+use spm_core::distro::{Distro, DistroInfo};
+
 use crate::error::RpmError;
 use crate::header::HeaderBuilder;
 use crate::lead;
@@ -41,6 +43,7 @@ impl RpmBuilder {
         plan: &PackagePlan,
         config: &Config,
         output_path: &Path,
+        target_distro: Option<&Distro>,
     ) -> Result<(), RpmError> {
         let cpio_format = if plan.needs_extended_cpio {
             CpioFormat::Extended
@@ -79,8 +82,14 @@ impl RpmBuilder {
         }
 
         // 3. Build metadata header.
-        let header_bytes =
-            build_metadata_header(sub_package, plan, config, &file_digests, &algorithm)?;
+        let header_bytes = build_metadata_header(
+            sub_package,
+            plan,
+            config,
+            &file_digests,
+            &algorithm,
+            target_distro,
+        )?;
 
         // 4. Build signature header.
         let sig_bytes =
@@ -123,6 +132,7 @@ fn build_metadata_header(
     config: &Config,
     file_digests: &[String],
     algorithm: &Algorithm,
+    target_distro: Option<&Distro>,
 ) -> Result<Vec<u8>, RpmError> {
     let mut hdr = HeaderBuilder::new();
 
@@ -137,7 +147,7 @@ fn build_metadata_header(
         )?;
     }
 
-    add_dependencies(&mut hdr, config, algorithm)?;
+    add_dependencies(&mut hdr, config, algorithm, target_distro)?;
     add_scripts(&mut hdr, &sub_package.scripts)?;
 
     // Region tag (must be added last — its data goes at end of data section).
@@ -195,6 +205,11 @@ fn add_package_metadata(
         .and_then(|r| r.group.as_deref())
         .unwrap_or("Unspecified");
     hdr.add_i18n_string(RPMTAG_GROUP, group);
+
+    // Vendor (optional).
+    if let Some(vendor) = &config.package.vendor {
+        hdr.add_string(RPMTAG_VENDOR, vendor);
+    }
 
     // URL (optional).
     if let Some(url) = &config.package.url {
@@ -385,6 +400,7 @@ fn add_dependencies(
     hdr: &mut HeaderBuilder,
     config: &Config,
     algorithm: &Algorithm,
+    target_distro: Option<&Distro>,
 ) -> Result<(), RpmError> {
     let mut names: Vec<String> = Vec::new();
     let mut versions: Vec<String> = Vec::new();
@@ -419,6 +435,20 @@ fn add_dependencies(
         flags.push(dep_flags);
     }
 
+    // Alternatives auto-dependency injection.
+    if !config.content.alternatives.is_empty() {
+        let alt_dep = match target_distro {
+            Some(distro) => match distro.info() {
+                DistroInfo::Rpm(info) => info.alternatives_dep,
+                DistroInfo::Deb(_) => "/usr/sbin/alternatives",
+            },
+            None => "/usr/sbin/alternatives",
+        };
+        names.push(alt_dep.to_owned());
+        versions.push(String::new());
+        flags.push(RPMSENSE_ANY as i32);
+    }
+
     if !names.is_empty() {
         hdr.add_string_array(RPMTAG_REQUIRENAME, names);
         hdr.add_string_array(RPMTAG_REQUIREVERSION, versions);
@@ -435,6 +465,38 @@ fn add_dependencies(
     hdr.add_string_array(RPMTAG_PROVIDENAME, provide_names);
     hdr.add_string_array(RPMTAG_PROVIDEVERSION, provide_versions);
     hdr.add_int32(RPMTAG_PROVIDEFLAGS, provide_flags);
+
+    // Conflicts.
+    if !config.package.dependencies.conflicts.is_empty() {
+        let mut cnames = Vec::new();
+        let mut cversions = Vec::new();
+        let mut cflags = Vec::new();
+        for dep in &config.package.dependencies.conflicts {
+            let (name, version, dep_flags) = parse_dependency(dep);
+            cnames.push(name);
+            cversions.push(version);
+            cflags.push(dep_flags);
+        }
+        hdr.add_string_array(RPMTAG_CONFLICTNAME, cnames);
+        hdr.add_string_array(RPMTAG_CONFLICTVERSION, cversions);
+        hdr.add_int32(RPMTAG_CONFLICTFLAGS, cflags);
+    }
+
+    // Obsoletes (from config's "replaces" field).
+    if !config.package.dependencies.replaces.is_empty() {
+        let mut onames = Vec::new();
+        let mut oversions = Vec::new();
+        let mut oflags = Vec::new();
+        for dep in &config.package.dependencies.replaces {
+            let (name, version, dep_flags) = parse_dependency(dep);
+            onames.push(name);
+            oversions.push(version);
+            oflags.push(dep_flags);
+        }
+        hdr.add_string_array(RPMTAG_OBSOLETENAME, onames);
+        hdr.add_string_array(RPMTAG_OBSOLETEVERSION, oversions);
+        hdr.add_int32(RPMTAG_OBSOLETEFLAGS, oflags);
+    }
 
     Ok(())
 }
@@ -484,6 +546,14 @@ fn add_scripts(
     if let Some(ref s) = scripts.post_remove {
         hdr.add_string(RPMTAG_POSTUN, s);
         hdr.add_string(RPMTAG_POSTUNPROG, "/bin/sh");
+    }
+    if let Some(ref s) = scripts.pre_trans {
+        hdr.add_string(RPMTAG_PRETRANS, s);
+        hdr.add_string(RPMTAG_PRETRANSPROG, "/bin/sh");
+    }
+    if let Some(ref s) = scripts.post_trans {
+        hdr.add_string(RPMTAG_POSTTRANS, s);
+        hdr.add_string(RPMTAG_POSTTRANSPROG, "/bin/sh");
     }
     Ok(())
 }
@@ -780,5 +850,220 @@ mod tests {
             group: "root".into(),
             is_config: false,
         }
+    }
+
+    /// Helper: build a minimal Config for dependency/metadata tests.
+    fn make_test_config() -> Config {
+        use spm_core::config::*;
+        Config {
+            package: PackageConfig {
+                name: "testpkg".into(),
+                version: "1.0".into(),
+                release: "1".into(),
+                arch: "x86_64".into(),
+                license: "MIT".into(),
+                maintainer: "Test <test@test.com>".into(),
+                description: "Test package".into(),
+                url: None,
+                vendor: None,
+                dependencies: DependencyConfig::default(),
+            },
+            content: ContentConfig {
+                source_dir: PathBuf::from("/tmp"),
+                defaults: ContentDefaults::default(),
+                files: vec![],
+                symlinks: vec![],
+                directories: vec![],
+                alternatives: vec![],
+            },
+            scripts: ScriptsConfig::default(),
+            compression: CompressionConfig::default(),
+            splitting: SplittingConfig::default(),
+            signing: None,
+            rpm: None,
+            deb: None,
+            build: None,
+        }
+    }
+
+    #[test]
+    fn test_vendor_tag_emitted() {
+        let mut config = make_test_config();
+        config.package.vendor = Some("TestVendor Inc.".into());
+
+        let mut hdr = HeaderBuilder::new();
+        let plan = PackagePlan {
+            name: "testpkg".into(),
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "x86_64".into(),
+            sub_packages: vec![],
+            is_split: false,
+            needs_extended_cpio: false,
+            total_size: 0,
+            warnings: vec![],
+        };
+        let sub_pkg = SubPackage {
+            name: "testpkg".into(),
+            role: spm_core::planner::SubPackageRole::Standalone,
+            files: vec![],
+            total_size: 0,
+            scripts: spm_core::alternatives::ResolvedScripts::default(),
+        };
+        add_package_metadata(&mut hdr, &plan, &sub_pkg, &config, &Algorithm::Zstd).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        // RPMTAG_VENDOR (1011) should appear in the binary header.
+        // The string "TestVendor Inc." should be present in the data section.
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("TestVendor Inc."));
+    }
+
+    #[test]
+    fn test_vendor_tag_not_emitted_when_none() {
+        let config = make_test_config();
+
+        let mut hdr = HeaderBuilder::new();
+        let plan = PackagePlan {
+            name: "testpkg".into(),
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "x86_64".into(),
+            sub_packages: vec![],
+            is_split: false,
+            needs_extended_cpio: false,
+            total_size: 0,
+            warnings: vec![],
+        };
+        let sub_pkg = SubPackage {
+            name: "testpkg".into(),
+            role: spm_core::planner::SubPackageRole::Standalone,
+            files: vec![],
+            total_size: 0,
+            scripts: spm_core::alternatives::ResolvedScripts::default(),
+        };
+        add_package_metadata(&mut hdr, &plan, &sub_pkg, &config, &Algorithm::Zstd).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(!data_str.contains("TestVendor"));
+    }
+
+    #[test]
+    fn test_pretrans_posttrans_emitted() {
+        use spm_core::alternatives::ResolvedScripts;
+
+        let scripts = ResolvedScripts {
+            pre_install: None,
+            post_install: None,
+            pre_remove: None,
+            post_remove: None,
+            pre_trans: Some("echo pretrans".into()),
+            post_trans: Some("echo posttrans".into()),
+        };
+
+        let mut hdr = HeaderBuilder::new();
+        add_scripts(&mut hdr, &scripts).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("echo pretrans"));
+        assert!(data_str.contains("echo posttrans"));
+    }
+
+    #[test]
+    fn test_conflicts_emitted() {
+        let mut config = make_test_config();
+        config.package.dependencies.conflicts = vec!["otherpkg >= 2.0".into()];
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("otherpkg"));
+    }
+
+    #[test]
+    fn test_obsoletes_emitted() {
+        let mut config = make_test_config();
+        config.package.dependencies.replaces = vec!["oldpkg < 1.0".into()];
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("oldpkg"));
+    }
+
+    #[test]
+    fn test_alternatives_dep_el8() {
+        let mut config = make_test_config();
+        config.content.alternatives = vec![spm_core::config::AlternativeConfig {
+            name: "editor".into(),
+            link: "/usr/bin/editor".into(),
+            path: "/opt/app/bin/editor".into(),
+            priority: 100,
+            followers: vec![],
+        }];
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8)).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("chkconfig"));
+    }
+
+    #[test]
+    fn test_alternatives_dep_el9() {
+        let mut config = make_test_config();
+        config.content.alternatives = vec![spm_core::config::AlternativeConfig {
+            name: "editor".into(),
+            link: "/usr/bin/editor".into(),
+            path: "/opt/app/bin/editor".into(),
+            priority: 100,
+            followers: vec![],
+        }];
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9)).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("alternatives"));
+    }
+
+    #[test]
+    fn test_alternatives_dep_default() {
+        let mut config = make_test_config();
+        config.content.alternatives = vec![spm_core::config::AlternativeConfig {
+            name: "editor".into(),
+            link: "/usr/bin/editor".into(),
+            path: "/opt/app/bin/editor".into(),
+            priority: 100,
+            followers: vec![],
+        }];
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(data_str.contains("/usr/sbin/alternatives"));
+    }
+
+    #[test]
+    fn test_no_alternatives_no_dep() {
+        let config = make_test_config();
+
+        let mut hdr = HeaderBuilder::new();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+
+        let bytes = hdr.build().unwrap();
+        let data_str = String::from_utf8_lossy(&bytes);
+        assert!(!data_str.contains("/usr/sbin/alternatives"));
+        assert!(!data_str.contains("chkconfig"));
     }
 }

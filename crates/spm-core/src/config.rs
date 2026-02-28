@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::error::ConfigError;
 
 /// Top-level spm configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Package metadata (name, version, arch, etc.).
     pub package: PackageConfig,
@@ -39,7 +39,7 @@ pub struct Config {
 }
 
 /// Package identity and metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PackageConfig {
     /// Package name (e.g. "matlab").
     pub name: String,
@@ -72,7 +72,7 @@ fn default_release() -> String {
 }
 
 /// Package dependency declarations (common + format-specific).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct DependencyConfig {
     /// Common requires (translated per format).
     #[serde(default)]
@@ -95,7 +95,7 @@ pub struct DependencyConfig {
 }
 
 /// Content mapping: source directory, file rules, symlinks, alternatives.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContentConfig {
     /// Root directory containing files to package.
     pub source_dir: PathBuf,
@@ -122,7 +122,7 @@ pub struct ContentConfig {
 /// 1. Per-mapping override (content.files[].user/group/mode/dir_mode)
 /// 2. Global defaults (content.defaults.user/group/file_mode/dir_mode)
 /// 3. Source file metadata on disk
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContentDefaults {
     /// Default owner for all entries.
     #[serde(default = "default_root")]
@@ -154,7 +154,7 @@ impl Default for ContentDefaults {
 }
 
 /// A single file mapping rule (source glob/path to destination).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FileMapping {
     /// Source path or glob pattern.
     pub src: String,
@@ -178,7 +178,7 @@ pub struct FileMapping {
 }
 
 /// A static symlink to include in the package.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SymlinkMapping {
     /// Symlink target (what the symlink points to).
     pub src: String,
@@ -187,7 +187,7 @@ pub struct SymlinkMapping {
 }
 
 /// A directory to create with specific ownership/permissions.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DirectoryMapping {
     /// Directory path.
     pub path: String,
@@ -203,7 +203,7 @@ pub struct DirectoryMapping {
 }
 
 /// An update-alternatives entry for declarative alternatives management.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AlternativeConfig {
     /// Alternatives group name (e.g. "matlab").
     pub name: String,
@@ -219,7 +219,7 @@ pub struct AlternativeConfig {
 }
 
 /// A follower (secondary) link in an alternatives group.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AlternativeFollower {
     /// Follower alternative name.
     pub name: String,
@@ -230,7 +230,7 @@ pub struct AlternativeFollower {
 }
 
 /// Install/remove script paths.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ScriptsConfig {
     /// Pre-install script.
     pub pre_install: Option<PathBuf>,
@@ -247,7 +247,7 @@ pub struct ScriptsConfig {
 }
 
 /// Compression configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CompressionConfig {
     /// Compression algorithm: "zstd", "xz", "gzip", "none".
     #[serde(default = "default_algorithm")]
@@ -275,7 +275,7 @@ impl Default for CompressionConfig {
 }
 
 /// Auto-splitting configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SplittingConfig {
     /// Whether auto-splitting is enabled.
     #[serde(default = "default_true")]
@@ -310,7 +310,7 @@ impl Default for SplittingConfig {
 }
 
 /// A named split part for directory-based splitting.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SplitPart {
     /// Sub-package name suffix (e.g. "core", "toolboxes").
     pub name: String,
@@ -319,7 +319,7 @@ pub struct SplitPart {
 }
 
 /// PGP signing configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SigningConfig {
     /// Path to the PGP key file (supports `${VAR}` expansion).
     pub key_file: String,
@@ -328,7 +328,7 @@ pub struct SigningConfig {
 }
 
 /// RPM-specific overrides.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RpmOverrides {
     /// RPM group tag.
     pub group: Option<String>,
@@ -339,7 +339,7 @@ pub struct RpmOverrides {
 }
 
 /// DEB-specific overrides.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DebOverrides {
     /// Debian section (e.g. "science").
     pub section: Option<String>,
@@ -353,7 +353,7 @@ pub struct DebOverrides {
 }
 
 /// Build reproducibility settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BuildConfig {
     /// Fixed timestamp for reproducible builds.
     pub source_date_epoch: Option<String>,
@@ -374,6 +374,8 @@ impl Config {
             shellexpand::env(&raw).map_err(|e| ConfigError::EnvVar(e.var_name.to_string()))?;
         let config: Config = serde_yaml::from_str(&expanded)?;
         config.validate()?;
+        let config_dir = path.parent().unwrap_or(Path::new("."));
+        config.validate_with_dir(config_dir)?;
         Ok(config)
     }
 
@@ -414,6 +416,47 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Validate filesystem-dependent checks (source_dir, script files).
+    ///
+    /// Called after structural validation with the config file's parent directory
+    /// so relative script paths can be resolved correctly.
+    pub fn validate_with_dir(&self, config_dir: &Path) -> Result<(), ConfigError> {
+        // Check source_dir exists.
+        if !self.content.source_dir.exists() {
+            return Err(ConfigError::Validation(format!(
+                "source_dir '{}' does not exist",
+                self.content.source_dir.display()
+            )));
+        }
+
+        // Check script files exist.
+        let script_fields = [
+            ("scripts.pre_install", &self.scripts.pre_install),
+            ("scripts.post_install", &self.scripts.post_install),
+            ("scripts.pre_remove", &self.scripts.pre_remove),
+            ("scripts.post_remove", &self.scripts.post_remove),
+            ("scripts.pre_trans", &self.scripts.pre_trans),
+            ("scripts.post_trans", &self.scripts.post_trans),
+        ];
+        for (field_name, script_path) in &script_fields {
+            if let Some(p) = script_path {
+                let resolved = if p.is_absolute() {
+                    p.clone()
+                } else {
+                    config_dir.join(p)
+                };
+                if !resolved.exists() {
+                    return Err(ConfigError::Validation(format!(
+                        "{field_name}: script file '{}' does not exist",
+                        resolved.display()
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +474,8 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_config() {
+        // Ensure the source_dir referenced by the fixture exists.
+        let _ = std::fs::create_dir_all("/tmp/test-pkg");
         let path = fixtures_dir().join("minimal.yaml");
         let config = Config::load(&path).expect("should parse minimal config");
         assert_eq!(config.package.name, "testpkg");
@@ -443,10 +488,17 @@ mod tests {
 
     #[test]
     fn test_parse_full_config() {
-        // The full.yaml references ${SPM_SIGNING_KEY}, so we set it
+        // The full.yaml references ${SPM_SIGNING_KEY}, so we set it.
         std::env::set_var("SPM_SIGNING_KEY", "/tmp/test-key.gpg");
+        // Read and parse the YAML directly to test parsing without filesystem
+        // validation (source_dir /opt/matlab-staging/R2025a may not exist in CI).
         let path = fixtures_dir().join("full.yaml");
-        let config = Config::load(&path).expect("should parse full config");
+        let raw = std::fs::read_to_string(&path).expect("should read full.yaml");
+        let expanded = shellexpand::env(&raw).expect("env expansion should succeed");
+        let config: Config = serde_yaml::from_str(&expanded).expect("should parse full config");
+        config
+            .validate()
+            .expect("structural validation should pass");
         assert_eq!(config.package.name, "matlab");
         assert_eq!(config.package.version, "2025a");
         assert_eq!(config.package.arch, "x86_64");
@@ -588,5 +640,90 @@ splitting:
         let config: Config = serde_yaml::from_str(yaml).expect("should parse");
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("unsupported splitting strategy"));
+    }
+
+    #[test]
+    fn test_validate_missing_source_dir() {
+        let yaml = r#"
+package:
+  name: test
+  version: "1.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+content:
+  source_dir: /nonexistent/path/that/should/not/exist
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
+        config
+            .validate()
+            .expect("structural validation should pass");
+        let err = config.validate_with_dir(Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("source_dir"));
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_validate_source_dir_exists() {
+        let _ = std::fs::create_dir_all("/tmp/spm-test-validate");
+        let yaml = r#"
+package:
+  name: test
+  version: "1.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+content:
+  source_dir: /tmp/spm-test-validate
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
+        config.validate().expect("structural should pass");
+        config
+            .validate_with_dir(Path::new("."))
+            .expect("filesystem validation should pass");
+    }
+
+    #[test]
+    fn test_validate_missing_script_file() {
+        let _ = std::fs::create_dir_all("/tmp/spm-test-validate");
+        let yaml = r#"
+package:
+  name: test
+  version: "1.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+content:
+  source_dir: /tmp/spm-test-validate
+scripts:
+  post_install: nonexistent-script.sh
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
+        config.validate().expect("structural should pass");
+        let err = config.validate_with_dir(Path::new("/tmp")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("scripts.post_install"), "got: {msg}");
+        assert!(msg.contains("does not exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let yaml = r#"
+package:
+  name: clonetest
+  version: "1.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+content:
+  source_dir: /tmp
+"#;
+        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
+        let cloned = config.clone();
+        assert_eq!(cloned.package.name, "clonetest");
     }
 }

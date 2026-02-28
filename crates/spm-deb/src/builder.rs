@@ -38,12 +38,8 @@ impl DebBuilder {
         let mut output_paths = Vec::new();
 
         for sub_pkg in &plan.sub_packages {
-            let filename = PackageFileName::deb(
-                &sub_pkg.name,
-                &plan.version,
-                &plan.release,
-                &plan.arch,
-            );
+            let filename =
+                PackageFileName::deb(&sub_pkg.name, &plan.version, &plan.release, &plan.arch);
             let output_path = output_dir.join(&filename);
 
             // For meta-packages, compute Depends on all parts.
@@ -51,12 +47,7 @@ impl DebBuilder {
                 plan.sub_packages
                     .iter()
                     .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
-                    .map(|sp| {
-                        format!(
-                            "{} (= {}-{})",
-                            sp.name, plan.version, plan.release
-                        )
-                    })
+                    .map(|sp| format!("{} (= {}-{})", sp.name, plan.version, plan.release))
                     .collect()
             } else {
                 Vec::new()
@@ -234,11 +225,10 @@ fn write_tar_entry<W: Write>(
             header.set_mode(entry.mode);
             header.set_size(entry.size);
 
-            let mut file =
-                File::open(&entry.source_path).map_err(|e| DebError::SourceFile {
-                    path: entry.source_path.clone(),
-                    source: e,
-                })?;
+            let mut file = File::open(&entry.source_path).map_err(|e| DebError::SourceFile {
+                path: entry.source_path.clone(),
+                source: e,
+            })?;
             tar.append_data(&mut header, &tar_path, &mut file)
                 .map_err(|e| DebError::Tar(e.to_string()))?;
         }
@@ -388,6 +378,7 @@ mod tests {
             is_split: false,
             needs_extended_cpio: false,
             total_size: 0,
+            warnings: Vec::new(),
         }
     }
 
@@ -450,7 +441,11 @@ mod tests {
         // Note: the tar crate's path() strips the "./" prefix on readback.
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(entries.len(), 1);
         let path = entries[0].path().unwrap();
         assert_eq!(path.to_str().unwrap(), "usr/share/doc/hello.txt");
@@ -478,7 +473,11 @@ mod tests {
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(entries.len(), 1);
         let path = entries[0].path().unwrap();
         let path_str = path.to_str().unwrap();
@@ -513,7 +512,11 @@ mod tests {
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header().entry_type(), TarEntryType::Symlink);
         let link_name = entries[0].link_name().unwrap().unwrap();
@@ -548,7 +551,11 @@ mod tests {
         let compressed = std::fs::read(tmp.path()).unwrap();
         let decoder = flate2::read::GzDecoder::new(&compressed[..]);
         let mut archive = tar::Archive::new(decoder);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(entries.len(), 1);
     }
 
@@ -577,7 +584,11 @@ mod tests {
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         // Verify the path is relative (no leading "/").
         let path_str = entries[0].path().unwrap().to_string_lossy().to_string();
         assert!(
@@ -611,13 +622,7 @@ mod tests {
         let names: Vec<String> = archive
             .entries()
             .unwrap()
-            .map(|e| {
-                e.unwrap()
-                    .path()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
             .collect();
         // tar crate strips "./" prefix on readback.
         assert!(names.contains(&"control".to_string()));
@@ -647,13 +652,7 @@ mod tests {
         let names: Vec<String> = archive
             .entries()
             .unwrap()
-            .map(|e| {
-                e.unwrap()
-                    .path()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
             .collect();
         // tar crate strips "./" prefix on readback.
         assert!(names.contains(&"preinst".to_string()));
@@ -949,7 +948,11 @@ mod tests {
         // Extract data.tar from the ar archive and verify it's a valid but empty tar.
         let data_tar = extract_data_tar_from_deb(&data);
         let mut archive = tar::Archive::new(&data_tar[..]);
-        let entries: Vec<_> = archive.entries().unwrap().collect::<Result<_, _>>().unwrap();
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(entries.len(), 0);
     }
 

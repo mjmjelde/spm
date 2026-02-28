@@ -1,8 +1,8 @@
-//! Streaming compression abstraction for spm.
+//! Streaming compression and decompression abstraction for spm.
 //!
-//! Provides a unified interface for compressing data streams using zstd
-//! (with multi-threading support), gzip, and a no-op passthrough. Xz
-//! support is stubbed and will be added in a later phase.
+//! Provides a unified interface for compressing and decompressing data streams
+//! using zstd (with multi-threading support), gzip, xz (with multi-threading
+//! support), and a no-op passthrough.
 //!
 //! # Example
 //!
@@ -23,7 +23,7 @@
 //! assert!(!output.is_empty());
 //! ```
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use thiserror::Error;
 
@@ -46,7 +46,7 @@ pub enum Algorithm {
     Zstd,
     /// Gzip compression.
     Gzip,
-    /// XZ/LZMA2 compression (not yet implemented).
+    /// XZ/LZMA2 compression (multi-threaded via liblzma).
     Xz,
     /// No compression (passthrough).
     None,
@@ -145,7 +145,6 @@ impl CompressorConfig {
 ///
 /// # Errors
 ///
-/// Returns [`CompressError::Unsupported`] for [`Algorithm::Xz`] (not yet implemented).
 /// Returns [`CompressError::Io`] if the compression encoder fails to initialize.
 pub fn compress_writer<'a, W: Write + 'a>(
     config: &CompressorConfig,
@@ -165,10 +164,51 @@ pub fn compress_writer<'a, W: Write + 'a>(
             Ok(Box::new(encoder))
         }
         Algorithm::Xz => {
-            // xz support added in Phase 5 (requires liblzma bindings)
-            Err(CompressError::Unsupported("xz not yet implemented".into()))
+            let level = config.effective_level() as u32;
+            let threads = config.effective_threads() as u32;
+            if threads > 1 {
+                let stream = xz2::stream::MtStreamBuilder::new()
+                    .threads(threads)
+                    .preset(level)
+                    .encoder()
+                    .map_err(|e| {
+                        CompressError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
+                Ok(Box::new(xz2::write::XzEncoder::new_stream(output, stream)))
+            } else {
+                Ok(Box::new(xz2::write::XzEncoder::new(output, level)))
+            }
         }
         Algorithm::None => Ok(Box::new(output)),
+    }
+}
+
+/// Create a decompressing reader that wraps an input reader.
+///
+/// Data read from the returned reader is decompressed using the specified
+/// algorithm from the underlying `input` reader.
+///
+/// # Errors
+///
+/// Returns [`CompressError::Io`] if the decompression decoder fails to initialize.
+pub fn decompress_reader<'a, R: Read + 'a>(
+    algorithm: Algorithm,
+    input: R,
+) -> Result<Box<dyn Read + 'a>, CompressError> {
+    match algorithm {
+        Algorithm::Zstd => {
+            let decoder = zstd::stream::Decoder::new(input)?;
+            Ok(Box::new(decoder))
+        }
+        Algorithm::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(input);
+            Ok(Box::new(decoder))
+        }
+        Algorithm::Xz => {
+            let decoder = xz2::read::XzDecoder::new(input);
+            Ok(Box::new(decoder))
+        }
+        Algorithm::None => Ok(Box::new(input)),
     }
 }
 
@@ -299,18 +339,61 @@ mod tests {
     }
 
     #[test]
-    fn test_xz_returns_unsupported() {
-        let config = CompressorConfig {
-            algorithm: Algorithm::Xz,
-            level: None,
-            threads: 0,
-        };
-        let result = compress_writer(&config, std::io::sink());
-        match result {
-            Err(CompressError::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got: {other}"),
-            Ok(_) => panic!("expected error, got Ok"),
+    fn test_xz_roundtrip() {
+        let original = vec![42u8; 1_000_000];
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Xz,
+                level: Some(6),
+                threads: 1,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&original).unwrap();
         }
+        assert!(compressed.len() < original.len() / 10);
+        let mut decompressed = Vec::new();
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        std::io::copy(&mut decoder, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_xz_multithreaded() {
+        let original = vec![42u8; 1_000_000];
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Xz,
+                level: Some(6),
+                threads: 4,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&original).unwrap();
+        }
+        let mut decompressed = Vec::new();
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        std::io::copy(&mut decoder, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_xz_empty_input() {
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Xz,
+                level: None,
+                threads: 1,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&[]).unwrap();
+        }
+        assert!(!compressed.is_empty());
+        let mut decompressed = Vec::new();
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        std::io::copy(&mut decoder, &mut decompressed).unwrap();
+        assert!(decompressed.is_empty());
     }
 
     #[test]
@@ -337,6 +420,72 @@ mod tests {
         assert_eq!(Algorithm::Gzip.rpm_tag(), "gzip");
         assert_eq!(Algorithm::Xz.rpm_tag(), "xz");
         assert_eq!(Algorithm::None.rpm_tag(), "identity");
+    }
+
+    #[test]
+    fn test_decompress_zstd_roundtrip() {
+        let original = vec![42u8; 100_000];
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Zstd,
+                level: Some(3),
+                threads: 1,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&original).unwrap();
+        }
+        let mut decompressed = Vec::new();
+        let mut reader = decompress_reader(Algorithm::Zstd, &compressed[..]).unwrap();
+        std::io::copy(&mut reader, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_decompress_gzip_roundtrip() {
+        let original = vec![42u8; 100_000];
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Gzip,
+                level: Some(6),
+                threads: 0,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&original).unwrap();
+        }
+        let mut decompressed = Vec::new();
+        let mut reader = decompress_reader(Algorithm::Gzip, &compressed[..]).unwrap();
+        std::io::copy(&mut reader, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_decompress_xz_roundtrip() {
+        let original = vec![42u8; 100_000];
+        let mut compressed = Vec::new();
+        {
+            let config = CompressorConfig {
+                algorithm: Algorithm::Xz,
+                level: Some(6),
+                threads: 1,
+            };
+            let mut writer = compress_writer(&config, &mut compressed).unwrap();
+            writer.write_all(&original).unwrap();
+        }
+        let mut decompressed = Vec::new();
+        let mut reader = decompress_reader(Algorithm::Xz, &compressed[..]).unwrap();
+        std::io::copy(&mut reader, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_decompress_none_passthrough() {
+        let original = vec![42u8; 1000];
+        let mut decompressed = Vec::new();
+        let mut reader = decompress_reader(Algorithm::None, &original[..]).unwrap();
+        std::io::copy(&mut reader, &mut decompressed).unwrap();
+        assert_eq!(original, decompressed);
     }
 
     #[test]

@@ -31,4 +31,8 @@ pub enum RpmError {
     /// Error constructing the RPM header.
     #[error("RPM header error: {0}")]
     Header(String),
+
+    /// Invalid RPM file structure.
+    #[error("invalid RPM: {0}")]
+    InvalidRpm(String),
 }

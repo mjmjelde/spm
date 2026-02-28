@@ -33,4 +33,8 @@ pub enum DebError {
     /// Error generating control data.
     #[error("control file error: {0}")]
     Control(String),
+
+    /// Invalid DEB file structure.
+    #[error("invalid DEB: {0}")]
+    InvalidDeb(String),
 }

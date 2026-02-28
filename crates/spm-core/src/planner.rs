@@ -3,6 +3,8 @@
 /// The planner takes a parsed config and format limits, walks the source directory,
 /// determines whether splitting is needed, resolves scripts (including alternatives
 /// injection), and produces a `PackagePlan` that later phases use to build packages.
+use std::path::Path;
+
 use crate::alternatives::{resolve_scripts, ResolvedScripts};
 use crate::config::Config;
 use crate::error::PlanError;
@@ -28,6 +30,8 @@ pub struct PackagePlan {
     pub needs_extended_cpio: bool,
     /// Total uncompressed size across all sub-packages.
     pub total_size: u64,
+    /// Non-fatal warnings generated during planning.
+    pub warnings: Vec<String>,
 }
 
 /// A single buildable package (standalone, meta-package, or part of a split).
@@ -64,7 +68,11 @@ impl Planner {
     ///
     /// This walks the source directory, calculates sizes, resolves scripts,
     /// and determines whether splitting is needed.
-    pub fn plan(config: &Config, limits: &FormatLimits) -> Result<PackagePlan, PlanError> {
+    pub fn plan(
+        config: &Config,
+        limits: &FormatLimits,
+        config_dir: &Path,
+    ) -> Result<PackagePlan, PlanError> {
         let source_dir = &config.content.source_dir;
 
         // Walk the file tree.
@@ -77,11 +85,7 @@ impl Planner {
         });
 
         // Resolve scripts with alternatives injection.
-        // Config dir is the parent of the config file, but since we don't have
-        // the config file path here, we use the source_dir's parent or cwd.
-        // In practice, the CLI passes the config dir separately.
-        let config_dir = std::env::current_dir().unwrap_or_default();
-        let scripts = resolve_scripts(&config.scripts, &config.content.alternatives, &config_dir)?;
+        let scripts = resolve_scripts(&config.scripts, &config.content.alternatives, config_dir)?;
 
         let pkg_name = &config.package.name;
 
@@ -193,6 +197,7 @@ impl Planner {
             is_split,
             needs_extended_cpio,
             total_size,
+            warnings: Vec::new(),
         })
     }
 
@@ -310,6 +315,7 @@ impl Planner {
             is_split,
             needs_extended_cpio,
             total_size,
+            warnings: Vec::new(),
         })
     }
 }

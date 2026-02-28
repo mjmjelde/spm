@@ -66,3 +66,36 @@
 - Validated with `dpkg-deb -I`, `dpkg-deb -c`, `dpkg -i`, `dpkg -r`, `dpkg --purge` on
   Ubuntu 24.04 container — scripts, conffiles, dependencies, metadata all verified
 - 48 unit tests (ar: 12, control: 16, builder: 20)
+
+### Phase 5a: Library Hardening & Distro Compatibility
+
+- Added XZ compression support to `spm-compress` (single-threaded and multi-threaded via `xz2`)
+- Created `distro` module in `spm-core` with compile-time database of known Linux distributions
+  (EL8, EL9, Ubuntu 20.04/22.04/24.04, Fedora) and their packaging capabilities
+- Added `check_compatibility()` for format/compression/large-file compatibility warnings
+- Added `minimum_rpm_version()` and `minimum_dpkg_version()` for `spm plan` output
+- Filled RPM builder gaps: LONGFILESIZES (tag 5008) for 64-bit per-file sizes, LONGSIZE (5009) for
+  total size, PAYLOADFORMAT/PAYLOADCOMPRESSOR/PAYLOADFLAGS tags, rpmlib(PayloadIsZstd) dependency
+- Made `Config` and sub-structs `Clone`-able for CLI override pattern
+- Added `BuildConfig` for `source_date_epoch` support
+- Enhanced config validation: reject negative compression levels, unknown algorithms at parse time
+- Improved error messages with source file paths and context
+- 28 new tests (204 total)
+
+### Phase 5b: CLI Integration — Build Flags, Inspect, Spinners
+
+- Added `decompress_reader()` to `spm-compress` for unified decompression (Zstd, Gzip, Xz, None)
+- Created RPM metadata reader (`spm-rpm/src/reader.rs`): parses lead, signature header (with 8-byte
+  alignment padding), and metadata header; extracts all key tags (NAME, VERSION, RELEASE, ARCH, SIZE,
+  LONGSIZE, DESCRIPTION, LICENSE, URL, VENDOR, PACKAGER, PAYLOADCOMPRESSOR, BASENAMES, REQUIRENAME)
+- Created DEB metadata reader (`spm-deb/src/reader.rs`): parses ar archive, walks members to find
+  `control.tar.{zst,gz,xz}`, decompresses with `spm_compress::decompress_reader()`, extracts
+  `./control` from tar, parses RFC 822 control fields with continuation line support
+- Expanded `spm build` with `--format all|rpm|deb` (default: all), `--no-split`,
+  `--source-date-epoch`, `--target-distro`, `--compression`, `--compression-level`, `--threads`
+- Expanded `spm plan` with the same override flags, minimum version display, and distro warnings
+- `--source-date-epoch` priority: CLI flag > `SOURCE_DATE_EPOCH` env var > config file value
+- Added `spm inspect <path>` subcommand: auto-detects `.rpm` or `.deb` by extension, displays
+  package metadata using the new readers
+- Added per-package progress spinners via `indicatif` with `--quiet` suppression
+- 22 new tests (226 total)

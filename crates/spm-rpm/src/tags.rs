@@ -34,6 +34,8 @@ pub enum TagType {
 
 /// Package name.
 pub const RPMTAG_NAME: u32 = 1000;
+/// Package vendor.
+pub const RPMTAG_VENDOR: u32 = 1011;
 /// Package version.
 pub const RPMTAG_VERSION: u32 = 1001;
 /// Package release.
@@ -136,6 +138,21 @@ pub const RPMTAG_PROVIDEFLAGS: u32 = 1112;
 /// Provided capability versions.
 pub const RPMTAG_PROVIDEVERSION: u32 = 1113;
 
+// ── Conflict/obsolete dependency tags ─────────────────────────────
+
+/// Conflict dependency flags.
+pub const RPMTAG_CONFLICTFLAGS: u32 = 1053;
+/// Conflict capability names.
+pub const RPMTAG_CONFLICTNAME: u32 = 1054;
+/// Conflict capability versions.
+pub const RPMTAG_CONFLICTVERSION: u32 = 1055;
+/// Obsolete dependency flags.
+pub const RPMTAG_OBSOLETEFLAGS: u32 = 1114;
+/// Obsolete capability versions.
+pub const RPMTAG_OBSOLETEVERSION: u32 = 1115;
+/// Obsolete capability names.
+pub const RPMTAG_OBSOLETENAME: u32 = 1090;
+
 // ── Script tags ────────────────────────────────────────────────────
 
 /// Pre-install script body.
@@ -154,6 +171,14 @@ pub const RPMTAG_POSTINPROG: u32 = 1086;
 pub const RPMTAG_PREUNPROG: u32 = 1087;
 /// Post-uninstall script interpreter.
 pub const RPMTAG_POSTUNPROG: u32 = 1088;
+/// Pre-transaction script body.
+pub const RPMTAG_PRETRANS: u32 = 1151;
+/// Post-transaction script body.
+pub const RPMTAG_POSTTRANS: u32 = 1152;
+/// Pre-transaction script interpreter.
+pub const RPMTAG_PRETRANSPROG: u32 = 1153;
+/// Post-transaction script interpreter.
+pub const RPMTAG_POSTTRANSPROG: u32 = 1154;
 
 // ── Region tags ───────────────────────────────────────────────────
 

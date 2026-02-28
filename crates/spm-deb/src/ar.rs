@@ -65,13 +65,7 @@ impl<W: Write> ArWriter<W> {
     /// Begin a streaming member. The caller must write exactly `size` bytes
     /// via [`writer_mut()`](Self::writer_mut), then call
     /// [`finish_member()`](Self::finish_member).
-    pub fn begin_member(
-        &mut self,
-        name: &str,
-        size: u64,
-        mtime: u64,
-        mode: u32,
-    ) -> io::Result<()> {
+    pub fn begin_member(&mut self, name: &str, size: u64, mtime: u64, mode: u32) -> io::Result<()> {
         self.ensure_magic()?;
         self.write_header(name, size, mtime, mode)?;
         self.needs_pad = size % 2 != 0;
@@ -139,10 +133,7 @@ mod tests {
         ar.write_member("a", b"x", 0, 0o100644).unwrap();
         ar.write_member("b", b"y", 0, 0o100644).unwrap();
         // Magic appears only at the start
-        let magic_count = buf
-            .windows(8)
-            .filter(|w| *w == b"!<arch>\n")
-            .count();
+        let magic_count = buf.windows(8).filter(|w| *w == b"!<arch>\n").count();
         assert_eq!(magic_count, 1);
     }
 
@@ -216,8 +207,7 @@ mod tests {
         // In-memory
         let mut buf1 = Vec::new();
         let mut ar1 = ArWriter::new(&mut buf1);
-        ar1.write_member("file.txt", data, 12345, 0o100644)
-            .unwrap();
+        ar1.write_member("file.txt", data, 12345, 0o100644).unwrap();
 
         // Streaming
         let mut buf2 = Vec::new();

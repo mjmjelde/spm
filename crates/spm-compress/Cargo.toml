@@ -8,5 +8,6 @@ description = "Streaming compression abstraction for spm"
 [dependencies]
 zstd = { version = "0.13", features = ["zstdmt"] }
 flate2 = "1"
+xz2 = "0.1"
 thiserror = "2"
 num_cpus = "1"
