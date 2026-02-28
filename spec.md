@@ -136,9 +136,6 @@ package:
     replaces: []
 
 content:
-  # Source directory to package
-  source_dir: /opt/matlab-staging/R2025a
-
   # Global defaults for all files (can be overridden per-mapping)
   defaults:
     user: root
@@ -152,6 +149,9 @@ content:
   #   src: /tmp/build/matlab/**    dst: /opt/matlab/
   #   A file at /tmp/build/matlab/bin/matlab becomes /opt/matlab/bin/matlab
   #   The src prefix before the glob is stripped and replaced with dst.
+  #
+  #   src: /tmp/build/matlab/       dst: /opt/matlab/
+  #   A bare directory path auto-expands to /tmp/build/matlab/** — same behavior.
   #
   #   src: /tmp/build/matlab/license.txt    dst: /opt/matlab/license.txt
   #   A literal file is mapped directly to dst.
@@ -251,9 +251,10 @@ content:
 |---------------|-------------|-------|-------------------|
 | `/tmp/build/**` | `/tmp/build/bin/tool` | `/opt/app/` | `/opt/app/bin/tool` |
 | `/tmp/build/**` | `/tmp/build/lib/libfoo.so` | `/opt/app/` | `/opt/app/lib/libfoo.so` |
+| `/tmp/build/` | `/tmp/build/bin/tool` | `/opt/app/` | `/opt/app/bin/tool` |
 | `/tmp/build/license.txt` | `/tmp/build/license.txt` | `/opt/app/LICENSE` | `/opt/app/LICENSE` |
 
-For glob patterns, the prefix before the `**` is stripped and replaced with `dst`. For literal paths, it's a direct 1:1 mapping.
+For glob patterns, the prefix before the `**` is stripped and replaced with `dst`. If `src` is a bare directory path (no glob characters), it is automatically expanded to `src/**` — so `/tmp/build/` and `/tmp/build/**` are equivalent. For literal file paths, it's a direct 1:1 mapping.
 
 **Per-mapping fields reference:**
 
@@ -347,7 +348,7 @@ This is the core differentiator. Before any bytes are written, `spm` walks the s
 ```
 PackagePlanner::plan(config) -> Result<PackagePlan>
 
-1. Walk source_dir recursively
+1. Walk file mappings, expanding glob patterns
 2. For each file: record path, size, mode, ownership, type
 3. Sum total uncompressed size
 4. Estimate compressed size (sampling-based heuristic or quick zstd level-1 pass)
@@ -731,7 +732,9 @@ package:
   name: matlab-2024b
   version: "2024b"
 content:
-  source_dir: /opt/matlab-staging/R2024b
+  files:
+    - src: "/opt/matlab-staging/R2024b/**"
+      dst: /opt/matlab/R2024b/
   alternatives:
     - name: matlab
       link: /usr/bin/matlab
@@ -745,7 +748,9 @@ package:
   name: matlab-2025a
   version: "2025a"
 content:
-  source_dir: /opt/matlab-staging/R2025a
+  files:
+    - src: "/opt/matlab-staging/R2025a/**"
+      dst: /opt/matlab/R2025a/
   alternatives:
     - name: matlab
       link: /usr/bin/matlab
@@ -1121,7 +1126,7 @@ mkdir -p /opt/matlab-staging/R2025a
 # 2. Create config
 spm init --name matlab --version 2025a
 
-# 3. Edit spm.yaml (set source_dir, deps, etc.)
+# 3. Edit spm.yaml (set file mappings, deps, etc.)
 vim spm.yaml
 
 # 4. Preview what will be built

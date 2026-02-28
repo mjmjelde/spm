@@ -1,5 +1,4 @@
 # Large package config for testing auto-split detection.
-# Used in integration tests — source_dir must be created by the test harness.
 package:
   name: largepkg
   version: "1.0.0"
@@ -9,7 +8,6 @@ package:
   description: "A large test package for split testing"
 
 content:
-  source_dir: /tmp/test-large-pkg
   files:
     - src: "/tmp/test-large-pkg/**"
       dst: /opt/largepkg/

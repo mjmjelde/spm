@@ -7,5 +7,4 @@ package:
   maintainer: test
   description: test
 
-content:
-  source_dir: /tmp/src
+content: {}

@@ -314,7 +314,6 @@ fn cmd_plan(
             .sum();
 
         println!("Package: {output_filename}");
-        println!("  Source: {}", config.content.source_dir.display());
         println!("  Files: {}", format_file_count(total_files));
         println!("  Uncompressed: {}", format_size(plan.total_size));
 
@@ -630,9 +629,6 @@ package:
     # replaces: []
 
 content:
-  # Directory containing the files to package
-  source_dir: /path/to/staged/files
-
   files:
     - src: "/path/to/staged/files/**"
       dst: /opt/{name}/

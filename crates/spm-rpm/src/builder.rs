@@ -869,7 +869,6 @@ mod tests {
                 dependencies: DependencyConfig::default(),
             },
             content: ContentConfig {
-                source_dir: PathBuf::from("/tmp"),
                 defaults: ContentDefaults::default(),
                 files: vec![],
                 symlinks: vec![],

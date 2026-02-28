@@ -8,7 +8,6 @@ package:
   description: "A minimal test package"
 
 content:
-  source_dir: /tmp/test-pkg
   files:
     - src: "/tmp/test-pkg/**"
       dst: /opt/testpkg/

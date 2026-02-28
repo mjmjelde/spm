@@ -1,8 +1,8 @@
 /// File tree walking and entry collection.
 ///
-/// Walks a source directory, applies file mapping rules from config,
-/// and produces a sorted, deduplicated list of `FileEntry` values
-/// representing every file, directory, and symlink to include in the package.
+/// Applies file mapping rules from config and produces a sorted, deduplicated
+/// list of `FileEntry` values representing every file, directory, and symlink
+/// to include in the package.
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -44,18 +44,11 @@ pub enum EntryType {
 pub struct FileTree;
 
 impl FileTree {
-    /// Walk the source directory, apply file mappings, and return all entries.
+    /// Walk file mappings, apply rules, and return all entries.
     ///
     /// The returned entries are sorted by `install_path` and deduplicated
     /// (first mapping match wins). Implicit parent directories are included.
-    pub fn walk(
-        source_dir: &Path,
-        content: &ContentConfig,
-    ) -> Result<Vec<FileEntry>, FileTreeError> {
-        if !source_dir.is_dir() {
-            return Err(FileTreeError::SourceDirNotFound(source_dir.to_owned()));
-        }
-
+    pub fn walk(content: &ContentConfig) -> Result<Vec<FileEntry>, FileTreeError> {
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut seen_install_paths: HashSet<PathBuf> = HashSet::new();
         // Track (dev, ino) -> first install_path for hardlink detection.
@@ -65,7 +58,7 @@ impl FileTree {
 
         // Process file mappings (first match wins).
         for mapping in &content.files {
-            let new_entries = process_file_mapping(source_dir, mapping, &mut inode_map, defaults)?;
+            let new_entries = process_file_mapping(mapping, &mut inode_map, defaults)?;
             for entry in new_entries {
                 if seen_install_paths.insert(entry.install_path.clone()) {
                     entries.push(entry);
@@ -132,7 +125,6 @@ impl FileTree {
 /// `glob::Pattern` for matching (the `glob::glob()` function doesn't match files
 /// with a trailing `/**` pattern). For simpler globs, `glob::glob()` is used directly.
 fn process_file_mapping(
-    source_dir: &Path,
     mapping: &crate::config::FileMapping,
     inode_map: &mut HashMap<(u64, u64), PathBuf>,
     defaults: &ContentDefaults,
@@ -144,11 +136,28 @@ fn process_file_mapping(
     let is_glob =
         src_pattern.contains('*') || src_pattern.contains('?') || src_pattern.contains('[');
 
-    // Resolve the pattern: if relative, make it relative to source_dir.
+    // Resolve the pattern: if relative, make it relative to the current working directory.
     let resolved_pattern = if Path::new(src_pattern).is_absolute() {
         src_pattern.to_string()
     } else {
-        source_dir.join(src_pattern).to_string_lossy().to_string()
+        std::env::current_dir()
+            .map_err(|e| FileTreeError::Metadata {
+                path: PathBuf::from(src_pattern),
+                source: e,
+            })?
+            .join(src_pattern)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    // If src is a plain directory path (no glob chars), auto-expand to dir/**
+    let (resolved_pattern, is_glob) = if !is_glob && Path::new(&resolved_pattern).is_dir() {
+        (
+            format!("{}/**", resolved_pattern.trim_end_matches('/')),
+            true,
+        )
+    } else {
+        (resolved_pattern, is_glob)
     };
 
     // Expand the pattern to a list of matching paths.
@@ -172,7 +181,7 @@ fn process_file_mapping(
 
     // Compute the glob base (longest non-glob prefix) for relative path calculation.
     let glob_base = if is_glob {
-        glob_base_path(src_pattern)
+        glob_base_path(&resolved_pattern)
     } else if Path::new(src_pattern).is_absolute() {
         // Single absolute file: the parent is the base.
         Path::new(src_pattern)
@@ -180,7 +189,7 @@ fn process_file_mapping(
             .unwrap_or(Path::new("/"))
             .to_path_buf()
     } else {
-        source_dir.to_path_buf()
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
 
     let file_mode_override = mapping.mode.as_ref().map(|m| parse_mode(m)).transpose()?;
@@ -448,9 +457,8 @@ mod tests {
     use tempfile::TempDir;
 
     /// Create a minimal ContentConfig for testing.
-    fn test_content(source_dir: &Path, files: Vec<FileMapping>) -> ContentConfig {
+    fn test_content(files: Vec<FileMapping>) -> ContentConfig {
         ContentConfig {
-            source_dir: source_dir.to_path_buf(),
             defaults: ContentDefaults::default(),
             files,
             symlinks: vec![],
@@ -461,12 +469,10 @@ mod tests {
 
     /// Create a ContentConfig with custom defaults.
     fn test_content_with_defaults(
-        source_dir: &Path,
         files: Vec<FileMapping>,
         defaults: ContentDefaults,
     ) -> ContentConfig {
         ContentConfig {
-            source_dir: source_dir.to_path_buf(),
             defaults,
             files,
             symlinks: vec![],
@@ -485,9 +491,7 @@ mod tests {
         fs::write(base.join("bin/hello"), "#!/bin/bash\necho hello").unwrap();
         fs::write(base.join("bin/world"), "#!/bin/bash\necho world").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/testpkg/".to_string(),
                 mode: None,
@@ -498,7 +502,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         // Should have the bin dir + 2 files + implicit parent /opt/testpkg.
         let file_entries: Vec<_> = entries
@@ -523,14 +527,50 @@ mod tests {
     }
 
     #[test]
+    fn test_walk_directory_src_auto_expand() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create test files.
+        fs::create_dir_all(base.join("bin")).unwrap();
+        fs::write(base.join("bin/hello"), "#!/bin/bash\necho hello").unwrap();
+        fs::write(base.join("bin/world"), "#!/bin/bash\necho world").unwrap();
+
+        // Use a bare directory path (no **) — should auto-expand.
+        let content = test_content(vec![FileMapping {
+                src: format!("{}", base.display()),
+                dst: "/opt/testpkg/".to_string(),
+                mode: None,
+                dir_mode: None,
+                user: None,
+                group: None,
+                r#type: None,
+            }],
+        );
+
+        let entries = FileTree::walk(&content).unwrap();
+
+        let file_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::RegularFile))
+            .collect();
+        assert_eq!(file_entries.len(), 2);
+
+        let install_paths: Vec<String> = entries
+            .iter()
+            .map(|e| e.install_path.to_string_lossy().to_string())
+            .collect();
+        assert!(install_paths.iter().any(|p| p.contains("bin/hello")));
+        assert!(install_paths.iter().any(|p| p.contains("bin/world")));
+    }
+
+    #[test]
     fn test_walk_mode_override() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
         fs::write(base.join("script.sh"), "#!/bin/bash").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/script.sh", base.display()),
                 dst: "/usr/bin/script.sh".to_string(),
                 mode: Some("0755".to_string()),
@@ -541,7 +581,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let file_entry = entries
             .iter()
             .find(|e| matches!(e.entry_type, EntryType::RegularFile))
@@ -555,9 +595,7 @@ mod tests {
         let base = tmp.path();
         fs::write(base.join("app.conf"), "setting=value").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/app.conf", base.display()),
                 dst: "/etc/app.conf".to_string(),
                 mode: None,
@@ -568,7 +606,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let file_entry = entries
             .iter()
             .find(|e| matches!(e.entry_type, EntryType::RegularFile))
@@ -580,11 +618,10 @@ mod tests {
     fn test_walk_symlink_entries() {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path();
-        // Need at least one file for the source_dir to be valid.
+        // Need at least one file mapping for the walk to succeed.
         fs::write(base.join("dummy"), "").unwrap();
 
         let content = ContentConfig {
-            source_dir: base.to_path_buf(),
             defaults: ContentDefaults::default(),
             files: vec![FileMapping {
                 src: format!("{}/dummy", base.display()),
@@ -603,7 +640,7 @@ mod tests {
             alternatives: vec![],
         };
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let sym = entries
             .iter()
             .find(|e| matches!(e.entry_type, EntryType::Symlink { .. }))
@@ -621,7 +658,6 @@ mod tests {
         fs::write(base.join("dummy"), "").unwrap();
 
         let content = ContentConfig {
-            source_dir: base.to_path_buf(),
             defaults: ContentDefaults::default(),
             files: vec![FileMapping {
                 src: format!("{}/dummy", base.display()),
@@ -642,7 +678,7 @@ mod tests {
             alternatives: vec![],
         };
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let dir = entries
             .iter()
             .find(|e| e.install_path == PathBuf::from("/var/log/app"))
@@ -651,15 +687,6 @@ mod tests {
         assert_eq!(dir.mode, 0o750);
         assert_eq!(dir.user, "app");
         assert_eq!(dir.group, "app");
-    }
-
-    #[test]
-    fn test_walk_nonexistent_source_dir() {
-        let content = test_content(Path::new("/nonexistent/path/12345"), vec![]);
-        let err = FileTree::walk(Path::new("/nonexistent/path/12345"), &content);
-        assert!(err.is_err());
-        let err = err.unwrap_err();
-        assert!(matches!(err, FileTreeError::SourceDirNotFound(_)));
     }
 
     #[test]
@@ -672,9 +699,7 @@ mod tests {
         fs::write(base.join("a/m.txt"), "m").unwrap();
         fs::write(base.join("b.txt"), "b").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/pkg/".to_string(),
                 mode: None,
@@ -685,8 +710,8 @@ mod tests {
             }],
         );
 
-        let entries1 = FileTree::walk(base, &content).unwrap();
-        let entries2 = FileTree::walk(base, &content).unwrap();
+        let entries1 = FileTree::walk(&content).unwrap();
+        let entries2 = FileTree::walk(&content).unwrap();
 
         let paths1: Vec<_> = entries1.iter().map(|e| &e.install_path).collect();
         let paths2: Vec<_> = entries2.iter().map(|e| &e.install_path).collect();
@@ -704,9 +729,7 @@ mod tests {
         let base = tmp.path();
         fs::write(base.join("tool"), "binary").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/tool", base.display()),
                 dst: "/opt/app/bin/tool".to_string(),
                 mode: None,
@@ -717,7 +740,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let dir_paths: HashSet<PathBuf> = entries
             .iter()
             .filter(|e| matches!(e.entry_type, EntryType::Directory))
@@ -735,9 +758,7 @@ mod tests {
         let base = tmp.path();
         fs::write(base.join("file"), "data").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/file", base.display()),
                 dst: "/opt/app/file".to_string(),
                 mode: None,
@@ -748,7 +769,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let file = entries
             .iter()
             .find(|e| matches!(e.entry_type, EntryType::RegularFile))
@@ -767,9 +788,7 @@ mod tests {
         fs::write(&file_a, "shared content").unwrap();
         fs::hard_link(&file_a, &file_b).unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/*", base.display()),
                 dst: "/opt/pkg/".to_string(),
                 mode: None,
@@ -780,7 +799,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
         let file_entries: Vec<_> = entries
             .iter()
             .filter(|e| {
@@ -838,9 +857,7 @@ mod tests {
             file_mode: None,
             dir_mode: None,
         };
-        let content = test_content_with_defaults(
-            base,
-            vec![FileMapping {
+        let content = test_content_with_defaults(vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/app/".to_string(),
                 mode: None,
@@ -852,7 +869,7 @@ mod tests {
             defaults,
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         // All entries should have group="appgroup" from global defaults.
         for entry in &entries {
@@ -878,9 +895,7 @@ mod tests {
             file_mode: None,
             dir_mode: None,
         };
-        let content = test_content_with_defaults(
-            base,
-            vec![
+        let content = test_content_with_defaults(vec![
                 FileMapping {
                     src: format!("{}/file_a", base.display()),
                     dst: "/opt/app/file_a".to_string(),
@@ -903,7 +918,7 @@ mod tests {
             defaults,
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         let file_a = entries
             .iter()
@@ -931,9 +946,7 @@ mod tests {
             file_mode: Some("0644".to_string()),
             dir_mode: Some("0755".to_string()),
         };
-        let content = test_content_with_defaults(
-            base,
-            vec![FileMapping {
+        let content = test_content_with_defaults(vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/app/".to_string(),
                 mode: None,
@@ -945,7 +958,7 @@ mod tests {
             defaults,
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         // Regular files should get file_mode 0o644.
         let files: Vec<_> = entries
@@ -973,9 +986,7 @@ mod tests {
         fs::create_dir_all(base.join("bin")).unwrap();
         fs::write(base.join("bin/tool"), "binary").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/app/".to_string(),
                 mode: None,
@@ -986,7 +997,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         // The src prefix before the glob should be stripped and replaced with dst.
         let tool = entries
@@ -1002,9 +1013,7 @@ mod tests {
         let base = tmp.path();
         fs::write(base.join("license.txt"), "MIT License").unwrap();
 
-        let content = test_content(
-            base,
-            vec![FileMapping {
+        let content = test_content(vec![FileMapping {
                 src: format!("{}/license.txt", base.display()),
                 dst: "/opt/app/LICENSE".to_string(),
                 mode: None,
@@ -1015,7 +1024,7 @@ mod tests {
             }],
         );
 
-        let entries = FileTree::walk(base, &content).unwrap();
+        let entries = FileTree::walk(&content).unwrap();
 
         // Direct 1:1 mapping — no stripping.
         let license = entries

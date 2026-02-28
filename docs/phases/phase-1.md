@@ -2,8 +2,9 @@
 
 ## What Was Implemented
 
-- File tree walker (`filetree.rs`) that walks source directories, applies glob patterns from config `content.files`, and produces a sorted, deduplicated list of `FileEntry` values
+- File tree walker (`filetree.rs`) that walks file mappings, applies glob patterns from config `content.files`, and produces a sorted, deduplicated list of `FileEntry` values
 - Glob expansion using `walkdir` + `glob::Pattern` for recursive `**` patterns (the `glob::glob()` function only matches directories with trailing `/**`, not files)
+- Bare directory `src` paths auto-expand to `dir/**` for recursive inclusion
 - Hardlink detection via `(dev, ino)` tracking with `MetadataExt`
 - Implicit parent directory generation for all file entries
 - Mode/user/group override from file mapping config

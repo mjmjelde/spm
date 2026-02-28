@@ -31,10 +31,6 @@ pub enum ConfigError {
 /// Errors that can occur during file tree walking.
 #[derive(Debug, Error)]
 pub enum FileTreeError {
-    /// Source directory does not exist or is not a directory.
-    #[error("source directory not found: {0}")]
-    SourceDirNotFound(PathBuf),
-
     /// A glob pattern could not be parsed.
     #[error("invalid glob pattern '{pattern}': {source}")]
     InvalidGlob {

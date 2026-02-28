@@ -169,7 +169,6 @@ pub struct DependencyConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ContentConfig {
-    pub source_dir: PathBuf,
     #[serde(default)]
     pub defaults: ContentDefaults,
     #[serde(default)]
@@ -590,7 +589,7 @@ impl FormatLimits {
 
 ### Steps
 
-1. Implement `FileTree::walk(source_dir, file_mappings)` — walks source dir, applies glob patterns from config `content.files`, returns `Vec<FileEntry>`
+1. Implement `FileTree::walk(content)` — applies glob patterns from config `content.files`, returns `Vec<FileEntry>`
 2. Implement mode/user/group override logic from config
 3. Implement symlink and directory entries from config
 4. Implement `Planner::plan(config, format_limits)` → `PackagePlan`
@@ -695,6 +694,7 @@ fn test_src_dst_path_stripping() {
     // File at /tmp/build/output/bin/tool
     // Assert: install_path == /opt/app/bin/tool
     // (src prefix before glob is stripped, replaced with dst)
+    // Note: bare directory paths auto-expand (src: /tmp/build/output/ → /tmp/build/output/**)
 }
 
 #[test]
@@ -1226,7 +1226,6 @@ podman run --rm -v /tmp/out:/pkg:ro ubuntu:24.04 bash -c \
    - Test on both EL8 and EL9 containers
 
 7. **Config file validation improvements:**
-   - Check that source_dir exists
    - Check that script files exist
    - Check that glob patterns match at least one file (warning)
    - Check that alternatives paths exist in the file tree

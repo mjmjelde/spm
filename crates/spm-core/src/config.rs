@@ -13,7 +13,7 @@ use crate::error::ConfigError;
 pub struct Config {
     /// Package metadata (name, version, arch, etc.).
     pub package: PackageConfig,
-    /// Content mappings (source dir, files, symlinks, alternatives).
+    /// Content mappings (files, symlinks, directories, alternatives).
     pub content: ContentConfig,
     /// Optional install/remove scripts.
     #[serde(default)]
@@ -94,11 +94,9 @@ pub struct DependencyConfig {
     pub replaces: Vec<String>,
 }
 
-/// Content mapping: source directory, file rules, symlinks, alternatives.
+/// Content mapping: file rules, symlinks, directories, alternatives.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentConfig {
-    /// Root directory containing files to package.
-    pub source_dir: PathBuf,
     /// Global defaults applied to all files unless overridden per-mapping.
     #[serde(default)]
     pub defaults: ContentDefaults,
@@ -417,19 +415,11 @@ impl Config {
         Ok(())
     }
 
-    /// Validate filesystem-dependent checks (source_dir, script files).
+    /// Validate filesystem-dependent checks (script files).
     ///
     /// Called after structural validation with the config file's parent directory
     /// so relative script paths can be resolved correctly.
     pub fn validate_with_dir(&self, config_dir: &Path) -> Result<(), ConfigError> {
-        // Check source_dir exists.
-        if !self.content.source_dir.exists() {
-            return Err(ConfigError::Validation(format!(
-                "source_dir '{}' does not exist",
-                self.content.source_dir.display()
-            )));
-        }
-
         // Check script files exist.
         let script_fields = [
             ("scripts.pre_install", &self.scripts.pre_install),
@@ -474,8 +464,6 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_config() {
-        // Ensure the source_dir referenced by the fixture exists.
-        let _ = std::fs::create_dir_all("/tmp/test-pkg");
         let path = fixtures_dir().join("minimal.yaml");
         let config = Config::load(&path).expect("should parse minimal config");
         assert_eq!(config.package.name, "testpkg");
@@ -491,7 +479,7 @@ mod tests {
         // The full.yaml references ${SPM_SIGNING_KEY}, so we set it.
         std::env::set_var("SPM_SIGNING_KEY", "/tmp/test-key.gpg");
         // Read and parse the YAML directly to test parsing without filesystem
-        // validation (source_dir /opt/matlab-staging/R2025a may not exist in CI).
+        // validation (/opt/matlab-staging/R2025a may not exist in CI).
         let path = fixtures_dir().join("full.yaml");
         let raw = std::fs::read_to_string(&path).expect("should read full.yaml");
         let expanded = shellexpand::env(&raw).expect("env expansion should succeed");
@@ -552,8 +540,7 @@ package:
   license: MIT
   maintainer: test
   description: test env expansion
-content:
-  source_dir: /tmp/src
+content: {}
 "#;
         let expanded = shellexpand::env(yaml).expect("env expansion should succeed");
         let config: Config = serde_yaml::from_str(&expanded).expect("should parse");
@@ -571,8 +558,7 @@ package:
   license: MIT
   maintainer: test
   description: test
-content:
-  source_dir: /tmp/src
+content: {}
 "#;
         let result = shellexpand::env(yaml);
         assert!(result.is_err());
@@ -588,8 +574,7 @@ package:
   license: MIT
   maintainer: test
   description: test defaults
-content:
-  source_dir: /tmp/src
+content: {}
 "#;
         let config: Config = serde_yaml::from_str(yaml).expect("should parse");
         config.validate().expect("should validate");
@@ -612,8 +597,7 @@ package:
   license: MIT
   maintainer: test
   description: test
-content:
-  source_dir: /tmp/src
+content: {}
 compression:
   algorithm: brotli
 "#;
@@ -632,8 +616,7 @@ package:
   license: MIT
   maintainer: test
   description: test
-content:
-  source_dir: /tmp/src
+content: {}
 splitting:
   strategy: random
 "#;
@@ -643,51 +626,7 @@ splitting:
     }
 
     #[test]
-    fn test_validate_missing_source_dir() {
-        let yaml = r#"
-package:
-  name: test
-  version: "1.0"
-  arch: x86_64
-  license: MIT
-  maintainer: test
-  description: test
-content:
-  source_dir: /nonexistent/path/that/should/not/exist
-"#;
-        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
-        config
-            .validate()
-            .expect("structural validation should pass");
-        let err = config.validate_with_dir(Path::new(".")).unwrap_err();
-        assert!(err.to_string().contains("source_dir"));
-        assert!(err.to_string().contains("does not exist"));
-    }
-
-    #[test]
-    fn test_validate_source_dir_exists() {
-        let _ = std::fs::create_dir_all("/tmp/spm-test-validate");
-        let yaml = r#"
-package:
-  name: test
-  version: "1.0"
-  arch: x86_64
-  license: MIT
-  maintainer: test
-  description: test
-content:
-  source_dir: /tmp/spm-test-validate
-"#;
-        let config: Config = serde_yaml::from_str(yaml).expect("should parse");
-        config.validate().expect("structural should pass");
-        config
-            .validate_with_dir(Path::new("."))
-            .expect("filesystem validation should pass");
-    }
-
-    #[test]
     fn test_validate_missing_script_file() {
-        let _ = std::fs::create_dir_all("/tmp/spm-test-validate");
         let yaml = r#"
 package:
   name: test
@@ -696,8 +635,7 @@ package:
   license: MIT
   maintainer: test
   description: test
-content:
-  source_dir: /tmp/spm-test-validate
+content: {}
 scripts:
   post_install: nonexistent-script.sh
 "#;
@@ -719,8 +657,7 @@ package:
   license: MIT
   maintainer: test
   description: test
-content:
-  source_dir: /tmp
+content: {}
 "#;
         let config: Config = serde_yaml::from_str(yaml).expect("should parse");
         let cloned = config.clone();

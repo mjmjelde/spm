@@ -22,7 +22,7 @@
 
 ## Known Limitations
 
-- `Config::load()` does not check that `source_dir` exists or that script files exist. This is deferred to Phase 1 (file tree walking) and Phase 5 (validation improvements).
+- `Config::load()` does not check that script files exist. This is deferred to Phase 5 (validation improvements).
 - No `--color` CLI flag yet (Phase 5).
 
 ## Testing

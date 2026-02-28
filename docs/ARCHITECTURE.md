@@ -73,7 +73,7 @@ spm-cpio      (standalone, only depends on thiserror)
 **File tree layer:**
 - `FileEntry` — A single file/dir/symlink to include in the package (install path, source path, type, size, mode, user/group).
 - `EntryType` — `RegularFile`, `Directory`, `Symlink { target }`, `Hardlink { target }`.
-- `FileTree::walk()` — Walks source directory, applies glob mappings, returns sorted/deduplicated entries.
+- `FileTree::walk()` — Walks file mappings, expands glob patterns (bare directory paths auto-expand to `dir/**`), returns sorted/deduplicated entries.
 - `FileTreeError` — Errors during file tree walking.
 
 **Planning layer:**

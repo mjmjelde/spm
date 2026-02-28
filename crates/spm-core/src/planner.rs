@@ -73,10 +73,8 @@ impl Planner {
         limits: &FormatLimits,
         config_dir: &Path,
     ) -> Result<PackagePlan, PlanError> {
-        let source_dir = &config.content.source_dir;
-
         // Walk the file tree.
-        let files = FileTree::walk(source_dir, &config.content)?;
+        let files = FileTree::walk(&config.content)?;
 
         // Calculate total size and detect extended cpio need.
         let total_size: u64 = files.iter().map(|f| f.size).sum();
@@ -491,7 +489,6 @@ mod tests {
                 dependencies: DependencyConfig::default(),
             },
             content: ContentConfig {
-                source_dir: PathBuf::from("/tmp"),
                 defaults: ContentDefaults::default(),
                 files: vec![],
                 symlinks: vec![],
