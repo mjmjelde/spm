@@ -15,6 +15,7 @@ use spm_compress::{compress_writer, Algorithm, CompressorConfig};
 use spm_core::config::Config;
 use spm_core::filetree::{EntryType, FileEntry};
 use spm_core::planner::{PackagePlan, SubPackage, SubPackageRole};
+use spm_core::progress::{BuildProgress, BuildStage, NoopProgress};
 use spm_core::types::PackageFileName;
 
 use crate::ar::ArWriter;
@@ -33,7 +34,11 @@ impl DebBuilder {
         plan: &PackagePlan,
         config: &Config,
         output_dir: &Path,
+        progress: Option<&dyn BuildProgress>,
     ) -> Result<Vec<PathBuf>, DebError> {
+        let noop = NoopProgress;
+        let prog: &dyn BuildProgress = progress.unwrap_or(&noop);
+
         std::fs::create_dir_all(output_dir)?;
         let mut output_paths = Vec::new();
 
@@ -53,7 +58,7 @@ impl DebBuilder {
                 Vec::new()
             };
 
-            build_single_deb(sub_pkg, plan, config, &output_path, &extra_depends)?;
+            build_single_deb(sub_pkg, plan, config, &output_path, &extra_depends, Some(prog))?;
             output_paths.push(output_path);
         }
 
@@ -62,13 +67,16 @@ impl DebBuilder {
 }
 
 /// Build a single `.deb` file from a SubPackage.
-fn build_single_deb(
+pub fn build_single_deb(
     sub_package: &SubPackage,
     plan: &PackagePlan,
     config: &Config,
     output_path: &Path,
     extra_depends: &[String],
+    progress: Option<&dyn BuildProgress>,
 ) -> Result<(), DebError> {
+    let noop = NoopProgress;
+    let progress: &dyn BuildProgress = progress.unwrap_or(&noop);
     let algorithm = resolve_algorithm(config)?;
     let compressor_config = make_compressor_config(&algorithm, config);
     let compress_ext = match algorithm {
@@ -78,9 +86,15 @@ fn build_single_deb(
     let mtime = resolve_mtime(config);
 
     // 1. Build data.tar.{ext} to temp file.
-    let (data_tmp, data_size) = write_data_tar(&sub_package.files, &compressor_config, mtime)?;
+    let file_count = sub_package.files.len() as u64;
+    let total_bytes = sub_package.total_size;
+    progress.stage_start(BuildStage::WritingPayload, file_count, total_bytes);
+    let (data_tmp, data_size) =
+        write_data_tar(&sub_package.files, &compressor_config, mtime, progress)?;
+    progress.stage_finish(BuildStage::WritingPayload);
 
     // 2. Build control.tar.{ext} to temp file.
+    progress.stage_start(BuildStage::WritingControl, 0, 0);
     let (control_tmp, control_size) = write_control_tar(
         sub_package,
         plan,
@@ -89,8 +103,10 @@ fn build_single_deb(
         &compressor_config,
         mtime,
     )?;
+    progress.stage_finish(BuildStage::WritingControl);
 
     // 3. Assemble the ar archive.
+    progress.stage_start(BuildStage::Assembling, 0, 0);
     let output_file = File::create(output_path).map_err(|e| DebError::SourceFile {
         path: output_path.to_owned(),
         source: e,
@@ -115,6 +131,7 @@ fn build_single_deb(
     ar.finish_member()?;
 
     ar.finish()?;
+    progress.stage_finish(BuildStage::Assembling);
     Ok(())
 }
 
@@ -123,6 +140,7 @@ fn write_data_tar(
     files: &[FileEntry],
     compressor_config: &CompressorConfig,
     mtime: u64,
+    progress: &dyn BuildProgress,
 ) -> Result<(tempfile::NamedTempFile, u64), DebError> {
     let tmp = tempfile::NamedTempFile::new()?;
     {
@@ -131,6 +149,7 @@ fn write_data_tar(
 
         for entry in files {
             write_tar_entry(&mut tar, entry, mtime)?;
+            progress.item_completed(entry.size);
         }
 
         // Finalize the tar (writes two 512-byte zero blocks).
@@ -407,7 +426,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, size) = write_data_tar(&[], &config, 0).unwrap();
+        let (tmp, size) = write_data_tar(&[], &config, 0, &NoopProgress).unwrap();
         // Even an empty tar has the two 512-byte zero blocks = 1024 bytes.
         assert!(size >= 1024);
         assert!(tmp.path().exists());
@@ -434,7 +453,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _size) = write_data_tar(&files, &config, 1000).unwrap();
+        let (tmp, _size) = write_data_tar(&files, &config, 1000, &NoopProgress).unwrap();
 
         // Read back and verify the tar contains our file.
         // Note: the tar crate's path() strips the "./" prefix on readback.
@@ -468,7 +487,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0).unwrap();
+        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -507,7 +526,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0).unwrap();
+        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -543,7 +562,7 @@ mod tests {
             level: Some(1),
             threads: 0,
         };
-        let (tmp, size) = write_data_tar(&files, &config, 0).unwrap();
+        let (tmp, size) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
         assert!(size > 0);
 
         // Decompress and verify.
@@ -579,7 +598,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0).unwrap();
+        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -710,7 +729,7 @@ mod tests {
         sub_pkg.total_size = 11;
 
         let output_path = dir.path().join("testpkg_1.0-1_amd64.deb");
-        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[]).unwrap();
+        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[], None).unwrap();
 
         // Read the ar archive and verify structure.
         let data = std::fs::read(&output_path).unwrap();
@@ -729,7 +748,7 @@ mod tests {
         let sub_pkg = test_sub_package("testpkg", SubPackageRole::Standalone);
 
         let output_path = dir.path().join("test.deb");
-        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[]).unwrap();
+        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[], None).unwrap();
 
         let data = std::fs::read(&output_path).unwrap();
         // debian-binary data starts at offset 68 (8 magic + 60 header).
@@ -744,7 +763,7 @@ mod tests {
         let sub_pkg = test_sub_package("testpkg", SubPackageRole::Standalone);
 
         let output_path = dir.path().join("test.deb");
-        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[]).unwrap();
+        build_single_deb(&sub_pkg, &plan, &config, &output_path, &[], None).unwrap();
 
         let data = std::fs::read(&output_path).unwrap();
         // Parse member names from the ar archive.
@@ -783,7 +802,7 @@ mod tests {
         let sub_pkg = test_sub_package("testpkg", SubPackageRole::Standalone);
         plan.sub_packages.push(sub_pkg);
 
-        let paths = DebBuilder::build(&plan, &config, &output_dir).unwrap();
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(
             paths[0].file_name().unwrap().to_str().unwrap(),
@@ -875,7 +894,7 @@ mod tests {
         plan.sub_packages = vec![meta, part1, part2];
         plan.total_size = 16;
 
-        let paths = DebBuilder::build(&plan, &config, &output_dir).unwrap();
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
         assert_eq!(paths.len(), 3);
 
         // Verify filenames.
@@ -903,7 +922,7 @@ mod tests {
         plan.is_split = true;
         plan.sub_packages = vec![meta, part1, part2];
 
-        let paths = DebBuilder::build(&plan, &config, &output_dir).unwrap();
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
 
         // Find the meta-package and read its control file.
         let meta_path = paths
@@ -941,7 +960,7 @@ mod tests {
         let mut plan = test_plan();
         plan.sub_packages = vec![meta];
 
-        let paths = DebBuilder::build(&plan, &config, &output_dir).unwrap();
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
         let data = std::fs::read(&paths[0]).unwrap();
 
         // Extract data.tar from the ar archive and verify it's a valid but empty tar.

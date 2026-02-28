@@ -37,7 +37,7 @@
 ## Design Decisions
 
 - **`walkdir` + `glob::Pattern` for recursive globs.** The `glob::glob()` function with `dir/**` only matches directories, not files within them. Using `walkdir` for traversal and `glob::Pattern::matches_path_with()` for filtering gives correct recursive behavior.
-- **Compression ratio estimation uses a fixed heuristic (0.35 for zstd).** Actual compression isn't available in Phase 1; the planner estimates compressed sizes for split decisions. This is conservative for binary software.
+- **Compression ratio estimation uses a fixed heuristic (0.35 for zstd).** Actual compression isn't available in Phase 1; the planner estimates compressed sizes for split decisions. A safety factor of 0.80 (`AUTO_SPLIT_HEADROOM`) is applied to format limits to account for estimation error up to ±20%. When splitting is triggered, parts are sized evenly rather than greedily filled.
 - **Meta-package gets all scripts; parts get none.** Per spec.md Section 4.3, this ensures alternatives registration and user scripts run once during install/remove, not per-part.
 - **Combined `$1` guard in pre-remove.** Both RPM (`"0"`) and DEB (`"remove"`) conditions are checked in a single `if` statement for simplicity.
 - **`plan_from_entries()` for testability.** A separate method accepts pre-built file entries, allowing planner tests to run without a real filesystem.
@@ -48,7 +48,7 @@
 - `types.rs`: size parsing/formatting, format limits, filename generation
 - `filetree.rs`: directory walking, glob expansion, mode overrides, config files, symlinks, directories, hardlinks, implicit parents, deterministic ordering
 - `alternatives.rs`: install/remove scriptlets, follower syntax, empty cases, script resolution ordering
-- `planner.rs`: no-split, auto-split, size-split, directory-split, extended cpio detection, splitting disabled, meta-package scripts, total size calculation
+- `planner.rs`: no-split, auto-split (even-parts sizing, borderline detection), size-split, directory-split, extended cpio detection, splitting disabled, meta-package scripts, total size calculation, build warnings
 
 ```bash
 # Run all tests

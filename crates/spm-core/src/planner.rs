@@ -9,7 +9,14 @@ use crate::alternatives::{resolve_scripts, ResolvedScripts};
 use crate::config::Config;
 use crate::error::PlanError;
 use crate::filetree::{EntryType, FileEntry, FileTree};
-use crate::types::{estimated_compression_ratio, parse_size, FormatLimits};
+use crate::types::{estimated_compression_ratio, format_size, parse_size, FormatLimits};
+
+/// Safety factor for auto-split decisions. Compression ratio estimates can be
+/// off by 20%+ depending on content type (text vs binary vs pre-compressed),
+/// so we trigger splitting when estimated compressed size exceeds 80% of the
+/// format limit. This prevents producing corrupt packages when the actual
+/// ratio is worse than predicted.
+const AUTO_SPLIT_HEADROOM: f64 = 0.80;
 
 /// The complete output of the planning phase.
 #[derive(Debug)]
@@ -88,11 +95,13 @@ impl Planner {
         let pkg_name = &config.package.name;
 
         // Determine if splitting is needed.
+        let ratio = estimated_compression_ratio(&config.compression.algorithm);
+        let estimated_compressed = (total_size as f64 * ratio) as u64;
+        let split_threshold = (limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM) as u64;
+
         let sub_packages = if !config.splitting.enabled {
-            // Splitting disabled — check if we're within limits.
-            let ratio = estimated_compression_ratio(&config.compression.algorithm);
-            let estimated_compressed = (total_size as f64 * ratio) as u64;
-            if estimated_compressed > limits.max_compressed_payload {
+            // Splitting disabled — check if we're within limits (with safety margin).
+            if estimated_compressed > split_threshold {
                 return Err(PlanError::ExceedsLimits {
                     format: limits.format_name.to_string(),
                     total_size: estimated_compressed,
@@ -108,10 +117,7 @@ impl Planner {
         } else {
             match config.splitting.strategy.as_str() {
                 "auto" => {
-                    let ratio = estimated_compression_ratio(&config.compression.algorithm);
-                    let estimated_compressed = (total_size as f64 * ratio) as u64;
-
-                    if estimated_compressed <= limits.max_compressed_payload {
+                    if estimated_compressed <= split_threshold {
                         // No split needed.
                         vec![SubPackage {
                             name: pkg_name.clone(),
@@ -121,10 +127,13 @@ impl Planner {
                             scripts,
                         }]
                     } else {
-                        // Split needed. Calculate max uncompressed size per part.
-                        let safety_factor = 0.90;
-                        let max_uncompressed_per_part =
-                            (limits.max_compressed_payload as f64 * safety_factor / ratio) as u64;
+                        // Split needed. Calculate number of even parts, then
+                        // divide total uncompressed size equally.
+                        let safe_limit =
+                            limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
+                        let num_parts =
+                            (estimated_compressed as f64 / safe_limit).ceil() as u64;
+                        let max_uncompressed_per_part = total_size / num_parts;
                         let mut parts = split_by_size(files, max_uncompressed_per_part, pkg_name);
                         fixup_hardlinks_across_parts(&mut parts);
                         build_split_packages(parts, pkg_name, scripts)
@@ -186,6 +195,12 @@ impl Planner {
             .iter()
             .any(|sp| sp.role == SubPackageRole::Meta);
 
+        let warnings = build_warnings(
+            is_split,
+            estimated_compressed,
+            limits,
+        );
+
         Ok(PackagePlan {
             name: pkg_name.clone(),
             version: config.package.version.clone(),
@@ -195,7 +210,7 @@ impl Planner {
             is_split,
             needs_extended_cpio,
             total_size,
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -213,10 +228,12 @@ impl Planner {
 
         let pkg_name = &config.package.name;
 
+        let ratio = estimated_compression_ratio(&config.compression.algorithm);
+        let estimated_compressed = (total_size as f64 * ratio) as u64;
+        let split_threshold = (limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM) as u64;
+
         let sub_packages = if !config.splitting.enabled {
-            let ratio = estimated_compression_ratio(&config.compression.algorithm);
-            let estimated_compressed = (total_size as f64 * ratio) as u64;
-            if estimated_compressed > limits.max_compressed_payload {
+            if estimated_compressed > split_threshold {
                 return Err(PlanError::ExceedsLimits {
                     format: limits.format_name.to_string(),
                     total_size: estimated_compressed,
@@ -232,10 +249,7 @@ impl Planner {
         } else {
             match config.splitting.strategy.as_str() {
                 "auto" => {
-                    let ratio = estimated_compression_ratio(&config.compression.algorithm);
-                    let estimated_compressed = (total_size as f64 * ratio) as u64;
-
-                    if estimated_compressed <= limits.max_compressed_payload {
+                    if estimated_compressed <= split_threshold {
                         vec![SubPackage {
                             name: pkg_name.clone(),
                             role: SubPackageRole::Standalone,
@@ -244,9 +258,11 @@ impl Planner {
                             scripts,
                         }]
                     } else {
-                        let safety_factor = 0.90;
-                        let max_uncompressed_per_part =
-                            (limits.max_compressed_payload as f64 * safety_factor / ratio) as u64;
+                        let safe_limit =
+                            limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
+                        let num_parts =
+                            (estimated_compressed as f64 / safe_limit).ceil() as u64;
+                        let max_uncompressed_per_part = total_size / num_parts;
                         let mut parts = split_by_size(files, max_uncompressed_per_part, pkg_name);
                         fixup_hardlinks_across_parts(&mut parts);
                         build_split_packages(parts, pkg_name, scripts)
@@ -304,6 +320,12 @@ impl Planner {
             .iter()
             .any(|sp| sp.role == SubPackageRole::Meta);
 
+        let warnings = build_warnings(
+            is_split,
+            estimated_compressed,
+            limits,
+        );
+
         Ok(PackagePlan {
             name: pkg_name.clone(),
             version: config.package.version.clone(),
@@ -313,9 +335,47 @@ impl Planner {
             is_split,
             needs_extended_cpio,
             total_size,
-            warnings: Vec::new(),
+            warnings,
         })
     }
+}
+
+/// Build warnings about packages that are close to format limits.
+fn build_warnings(
+    is_split: bool,
+    estimated_compressed: u64,
+    limits: &FormatLimits,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Only relevant for formats with a finite payload limit (DEB).
+    if limits.max_compressed_payload == u64::MAX {
+        return warnings;
+    }
+
+    let pct = estimated_compressed as f64 / limits.max_compressed_payload as f64 * 100.0;
+
+    if is_split && estimated_compressed <= limits.max_compressed_payload {
+        // Split was triggered by the safety margin, not by clearly exceeding the limit.
+        warnings.push(format!(
+            "splitting triggered by safety margin: estimated compressed size ({}) is \
+             {pct:.0}% of the {} format limit ({}); actual compression may vary ±20%",
+            format_size(estimated_compressed),
+            limits.format_name,
+            format_size(limits.max_compressed_payload),
+        ));
+    } else if !is_split && pct > 60.0 {
+        // Not split, but getting close to the limit.
+        warnings.push(format!(
+            "estimated compressed size ({}) is {pct:.0}% of the {} format limit ({}); \
+             consider enabling splitting for safety",
+            format_size(estimated_compressed),
+            limits.format_name,
+            format_size(limits.max_compressed_payload),
+        ));
+    }
+
+    warnings
 }
 
 /// Split files into parts by accumulated size.
@@ -789,6 +849,110 @@ mod tests {
         {
             assert!(sp.scripts.post_install.is_none());
         }
+    }
+
+    #[test]
+    fn test_auto_split_deb_borderline() {
+        // 25 GiB uncompressed × 0.35 = 8.75 GiB estimated.
+        // Raw DEB limit is 9.999 GiB, but with 0.80 headroom the threshold is ~8.0 GiB.
+        // 8.75 GiB > 8.0 GiB → should trigger splitting.
+        let config = test_config("borderline", "auto");
+        let limits = FormatLimits::deb();
+
+        let gib = 1024 * 1024 * 1024u64;
+        let files = vec![
+            test_file("/opt/pkg/data1.bin", 5 * gib),
+            test_file("/opt/pkg/data2.bin", 5 * gib),
+            test_file("/opt/pkg/data3.bin", 5 * gib),
+            test_file("/opt/pkg/data4.bin", 5 * gib),
+            test_file("/opt/pkg/data5.bin", 5 * gib),
+        ];
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
+            .unwrap();
+
+        assert!(plan.is_split, "expected splitting for borderline package");
+        // Should have a warning about safety margin since estimated < raw limit.
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("safety margin")),
+            "expected safety margin warning, got: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn test_splitting_disabled_borderline_errors() {
+        // With splitting disabled, a borderline package should error out.
+        let mut config = test_config("borderline", "auto");
+        config.splitting.enabled = false;
+
+        let limits = FormatLimits::deb();
+        let gib = 1024 * 1024 * 1024u64;
+        // 25 GiB × 0.35 = 8.75 GiB > 8.0 GiB threshold
+        let files = vec![test_file("/opt/pkg/huge.bin", 25 * gib)];
+
+        let result =
+            Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default());
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            PlanError::ExceedsLimits { .. }
+        ));
+    }
+
+    #[test]
+    fn test_plan_warning_near_limit() {
+        // A package that doesn't need splitting but is >60% of the limit.
+        // 18 GiB × 0.35 = 6.3 GiB → 63% of 9.999 GiB → should warn.
+        let config = test_config("nearlimit", "auto");
+        let limits = FormatLimits::deb();
+
+        let gib = 1024 * 1024 * 1024u64;
+        let files = vec![
+            test_file("/opt/pkg/data1.bin", 9 * gib),
+            test_file("/opt/pkg/data2.bin", 9 * gib),
+        ];
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
+            .unwrap();
+
+        assert!(!plan.is_split, "should not split at 63%");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("consider enabling splitting")),
+            "expected near-limit warning, got: {:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn test_no_warning_for_small_package() {
+        // Small package should have no warnings.
+        let config = test_config("smallpkg", "auto");
+        let limits = FormatLimits::deb();
+
+        let files = vec![test_file("/opt/pkg/small.bin", 1024)];
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
+            .unwrap();
+
+        assert!(!plan.is_split);
+        assert!(plan.warnings.is_empty(), "expected no warnings for small package");
+    }
+
+    #[test]
+    fn test_no_warning_for_rpm() {
+        // RPM has no practical limit (u64::MAX), so no warnings should be generated.
+        let config = test_config("rpmpkg", "auto");
+        let limits = FormatLimits::rpm();
+
+        let gib = 1024 * 1024 * 1024u64;
+        let files = vec![test_file("/opt/pkg/data.bin", 20 * gib)];
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
+            .unwrap();
+
+        assert!(plan.warnings.is_empty(), "expected no warnings for RPM");
     }
 
     #[test]

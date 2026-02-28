@@ -378,12 +378,19 @@ These are the hard constraints the planner must enforce:
 
 #### `auto` — Format-Aware Splitting
 
-The default. spm calculates the compressed payload size and splits if it would exceed the target format's hard limits. The splitter works as follows:
+The default. spm estimates the compressed payload size and splits if it would exceed 80% of the target format's hard limit. The 20% safety margin (`AUTO_SPLIT_HEADROOM = 0.80`) accounts for the fact that compression ratio estimates can vary ±20% depending on file content.
 
-1. Sort files by directory path (keeps related files together)
-2. Accumulate files into the current sub-package
-3. When the estimated compressed size approaches the limit (with a safety margin of ~500 MiB), start a new sub-package
-4. Generate a meta-package that depends on all parts
+The split algorithm produces **even-sized parts** rather than greedily filling each part to the maximum:
+
+1. Estimate compressed size: `estimated = total_uncompressed × compression_ratio`
+2. Calculate safe limit: `safe_limit = format_limit × 0.80`
+3. If `estimated > safe_limit`, compute number of parts: `num_parts = ceil(estimated / safe_limit)`
+4. Divide total uncompressed size evenly: `max_per_part = total_uncompressed / num_parts`
+5. Sort files by directory path (keeps related files together)
+6. Distribute files into parts using the even per-part limit
+7. Generate a meta-package that depends on all parts
+
+**Borderline warnings:** When `estimated` exceeds the safety threshold but is still under the raw format limit, the plan output warns that splitting was triggered by the safety margin. When a package is not split but estimated size exceeds 60% of the limit, a warning suggests enabling splitting for safety.
 
 **Generated package structure (DEB example):**
 
@@ -584,7 +591,7 @@ char ar_fmag[2]     "`\n"
 
 The 10-digit decimal `ar_size` field limits each member to 9,999,999,999 bytes (~9,536 MiB).
 
-**spm mitigation:** When the compressed `data.tar.*` would exceed ~9 GiB, spm activates auto-splitting. Unlike proposals to change the ar format (which would break existing dpkg versions), splitting produces multiple standard `.deb` packages that work with any dpkg.
+**spm mitigation:** The ar writer validates member sizes at write time and rejects any member exceeding 9,999,999,999 bytes with a clear error message, preventing silent archive corruption. When the estimated compressed `data.tar.*` would exceed 80% of this limit (~8 GiB), spm activates auto-splitting. Unlike proposals to change the ar format (which would break existing dpkg versions), splitting produces multiple standard `.deb` packages that work with any dpkg.
 
 ### 6.3 Tar Entry Size Constraints
 

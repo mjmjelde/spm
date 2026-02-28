@@ -14,11 +14,11 @@ use sha2::{Digest, Sha256};
 
 use spm_compress::{compress_writer, Algorithm, CompressorConfig};
 use spm_core::config::Config;
+use spm_core::distro::{Distro, DistroInfo};
 use spm_core::filetree::{EntryType, FileEntry};
 use spm_core::planner::{PackagePlan, SubPackage};
+use spm_core::progress::{BuildProgress, BuildStage, NoopProgress};
 use spm_cpio::{CpioFormat, CpioMetadata, CpioWriter};
-
-use spm_core::distro::{Distro, DistroInfo};
 
 use crate::error::RpmError;
 use crate::header::HeaderBuilder;
@@ -44,7 +44,11 @@ impl RpmBuilder {
         config: &Config,
         output_path: &Path,
         target_distro: Option<&Distro>,
+        progress: Option<&dyn BuildProgress>,
     ) -> Result<(), RpmError> {
+        let noop = NoopProgress;
+        let prog: &dyn BuildProgress = progress.unwrap_or(&noop);
+
         let cpio_format = if plan.needs_extended_cpio {
             CpioFormat::Extended
         } else {
@@ -59,9 +63,14 @@ impl RpmBuilder {
         };
 
         // 1. Compute file digests (SHA-256 hex) for all regular files.
-        let file_digests = compute_file_digests(&sub_package.files)?;
+        let file_count = sub_package.files.len() as u64;
+        let total_bytes = sub_package.total_size;
+        prog.stage_start(BuildStage::HashingFiles, file_count, total_bytes);
+        let file_digests = compute_file_digests(&sub_package.files, prog)?;
+        prog.stage_finish(BuildStage::HashingFiles);
 
         // 2. Write payload (cpio | compress) to temp file.
+        prog.stage_start(BuildStage::WritingPayload, file_count, total_bytes);
         let payload_tmp = tempfile::NamedTempFile::new()?;
         let uncompressed_size: u64;
         {
@@ -73,6 +82,7 @@ impl RpmBuilder {
                 let cpio_name = make_cpio_name(&entry.install_path, cpio_format);
 
                 write_cpio_entry(&mut cpio, index as u32, &cpio_name, &metadata, entry)?;
+                prog.item_completed(entry.size);
             }
 
             let (compressor, bytes) = cpio.finish()?;
@@ -80,8 +90,10 @@ impl RpmBuilder {
             // Drop the compressor to flush (auto_finish for zstd).
             drop(compressor);
         }
+        prog.stage_finish(BuildStage::WritingPayload);
 
         // 3. Build metadata header.
+        prog.stage_start(BuildStage::BuildingMetadata, 0, 0);
         let header_bytes = build_metadata_header(
             sub_package,
             plan,
@@ -90,12 +102,16 @@ impl RpmBuilder {
             &algorithm,
             target_distro,
         )?;
+        prog.stage_finish(BuildStage::BuildingMetadata);
 
         // 4. Build signature header.
+        prog.stage_start(BuildStage::ComputingSignature, 0, 0);
         let sig_bytes =
             signature::build_signature(&header_bytes, payload_tmp.path(), uncompressed_size)?;
+        prog.stage_finish(BuildStage::ComputingSignature);
 
         // 5. Assemble final RPM file.
+        prog.stage_start(BuildStage::Assembling, 0, 0);
         let mut output = File::create(output_path).map_err(|e| RpmError::SourceFile {
             path: output_path.to_owned(),
             source: e,
@@ -120,6 +136,7 @@ impl RpmBuilder {
         // Payload (stream from temp file).
         let mut payload_file = File::open(payload_tmp.path())?;
         io::copy(&mut payload_file, &mut output)?;
+        prog.stage_finish(BuildStage::Assembling);
 
         Ok(())
     }
@@ -662,7 +679,10 @@ fn write_cpio_entry<W: Write>(
 ///
 /// Returns one digest per file. Directories, symlinks, and zero-size
 /// hardlink entries get an empty string.
-fn compute_file_digests(files: &[FileEntry]) -> Result<Vec<String>, RpmError> {
+fn compute_file_digests(
+    files: &[FileEntry],
+    progress: &dyn BuildProgress,
+) -> Result<Vec<String>, RpmError> {
     let mut digests = Vec::with_capacity(files.len());
 
     for entry in files {
@@ -678,6 +698,7 @@ fn compute_file_digests(files: &[FileEntry]) -> Result<Vec<String>, RpmError> {
             _ => String::new(),
         };
         digests.push(digest);
+        progress.item_completed(entry.size);
     }
 
     Ok(digests)

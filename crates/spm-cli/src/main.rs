@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use spm_core::config::{BuildConfig, Config};
 use spm_core::distro::{self, Distro};
 use spm_core::planner::{count_files, Planner, SubPackageRole};
+use spm_core::progress::{BuildProgress, BuildStage};
 use spm_core::types::{format_size, FormatLimits, PackageFileName};
 
 /// spm — Large-file-aware Linux package builder
@@ -397,6 +399,12 @@ fn cmd_plan(
             print_distro_warnings(d, &config, fmt, plan.total_size);
         }
 
+        // Plan warnings (e.g. near format limits).
+        for warning in &plan.warnings {
+            println!();
+            println!("  Warning: {warning}");
+        }
+
         println!();
         println!("  Output: out/{output_filename}");
     }
@@ -441,6 +449,10 @@ fn cmd_build(
         )
     })?;
 
+    let build_start = Instant::now();
+    let multi = MultiProgress::new();
+    let mut build_results: Vec<BuildResult> = Vec::new();
+
     for fmt in &formats {
         let limits = match *fmt {
             "rpm" => FormatLimits::rpm(),
@@ -455,6 +467,10 @@ fn cmd_build(
             print_distro_warnings(d, &config, fmt, plan.total_size);
         }
 
+        if !quiet {
+            multi.println(format!("[{fmt}]")).ok();
+        }
+
         let total_sub = plan.sub_packages.len();
         match *fmt {
             "rpm" => {
@@ -467,8 +483,13 @@ fn cmd_build(
                     );
                     let output_path = output_dir.join(&filename);
 
-                    let spinner = make_spinner(quiet);
-                    spinner.set_message(format!("Building {filename}..."));
+                    let progress = if quiet {
+                        None
+                    } else {
+                        Some(IndicatifProgress::new(&multi, &filename))
+                    };
+
+                    let pkg_start = Instant::now();
 
                     spm_rpm::builder::RpmBuilder::build(
                         sub_pkg,
@@ -476,6 +497,7 @@ fn cmd_build(
                         &config,
                         &output_path,
                         distro.as_ref(),
+                        progress.as_ref().map(|p| p as &dyn BuildProgress),
                     )
                     .with_context(|| {
                         format!(
@@ -484,26 +506,90 @@ fn cmd_build(
                         )
                     })?;
 
-                    spinner.finish_with_message(format!(
-                        "{filename} ({})",
-                        format_size(sub_pkg.total_size)
-                    ));
+                    let elapsed = pkg_start.elapsed();
+                    let output_size = std::fs::metadata(&output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    if let Some(ref p) = progress {
+                        p.finish(output_size, elapsed);
+                    }
+
+                    build_results.push(BuildResult {
+                        filename,
+                        file_count: count_files(&sub_pkg.files),
+                        uncompressed_size: sub_pkg.total_size,
+                        compressed_size: output_size,
+                        duration: elapsed,
+                    });
                 }
             }
             "deb" => {
-                let spinner = make_spinner(quiet);
-                let deb_label = format!("{} {}-{}", plan.name, plan.version, plan.release);
-                spinner.set_message(format!("Building DEB packages for {deb_label}..."));
+                for (i, sub_pkg) in plan.sub_packages.iter().enumerate() {
+                    let filename = PackageFileName::deb(
+                        &sub_pkg.name,
+                        &plan.version,
+                        &plan.release,
+                        &plan.arch,
+                    );
+                    let output_path = output_dir.join(&filename);
 
-                let output_paths = spm_deb::builder::DebBuilder::build(&plan, &config, output_dir)
-                    .with_context(|| format!("failed to build DEB packages for '{deb_label}'"))?;
+                    let progress = if quiet {
+                        None
+                    } else {
+                        Some(IndicatifProgress::new(&multi, &filename))
+                    };
 
-                spinner.finish_and_clear();
-                for path in &output_paths {
-                    let filename = path.file_name().unwrap_or_default().to_string_lossy();
-                    if !quiet {
-                        println!("{filename}");
+                    let pkg_start = Instant::now();
+
+                    // For meta-packages, compute Depends on all parts.
+                    let extra_depends: Vec<String> =
+                        if sub_pkg.role == SubPackageRole::Meta {
+                            plan.sub_packages
+                                .iter()
+                                .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
+                                .map(|sp| {
+                                    format!(
+                                        "{} (= {}-{})",
+                                        sp.name, plan.version, plan.release
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                    spm_deb::builder::build_single_deb(
+                        sub_pkg,
+                        &plan,
+                        &config,
+                        &output_path,
+                        &extra_depends,
+                        progress.as_ref().map(|p| p as &dyn BuildProgress),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to build DEB '{filename}' (sub-package {} of {total_sub})",
+                            i + 1
+                        )
+                    })?;
+
+                    let elapsed = pkg_start.elapsed();
+                    let output_size = std::fs::metadata(&output_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    if let Some(ref p) = progress {
+                        p.finish(output_size, elapsed);
                     }
+
+                    build_results.push(BuildResult {
+                        filename,
+                        file_count: count_files(&sub_pkg.files),
+                        uncompressed_size: sub_pkg.total_size,
+                        compressed_size: output_size,
+                        duration: elapsed,
+                    });
                 }
             }
             _ => unreachable!(),
@@ -511,7 +597,7 @@ fn cmd_build(
     }
 
     if !quiet {
-        println!("Done.");
+        print_build_summary(&build_results, build_start.elapsed());
     }
     Ok(())
 }
@@ -570,19 +656,128 @@ fn cmd_inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create a progress spinner, or a hidden one if quiet mode is on.
-fn make_spinner(quiet: bool) -> ProgressBar {
-    if quiet {
-        return ProgressBar::hidden();
+// ---------------------------------------------------------------------------
+// Progress reporting
+// ---------------------------------------------------------------------------
+
+/// Per-package build result, collected for the final summary.
+struct BuildResult {
+    filename: String,
+    file_count: usize,
+    uncompressed_size: u64,
+    compressed_size: u64,
+    duration: Duration,
+}
+
+/// indicatif-backed progress reporter for a single sub-package build.
+///
+/// Shows a spinner with the current stage name and filename, plus a
+/// byte-level progress bar during data-intensive stages.
+struct IndicatifProgress {
+    multi: MultiProgress,
+    overall: ProgressBar,
+    filename: String,
+    detail: Mutex<Option<ProgressBar>>,
+    stage_start_time: Mutex<Option<Instant>>,
+}
+
+impl IndicatifProgress {
+    fn new(multi: &MultiProgress, filename: &str) -> Self {
+        let overall = multi.add(ProgressBar::new_spinner());
+        overall.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        overall.enable_steady_tick(Duration::from_millis(100));
+        overall.set_message(format!("{filename}: starting..."));
+
+        Self {
+            multi: multi.clone(),
+            overall,
+            filename: filename.to_string(),
+            detail: Mutex::new(None),
+            stage_start_time: Mutex::new(None),
+        }
     }
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner
+
+    /// Finish this package's progress display with a checkmark.
+    fn finish(&self, compressed_size: u64, duration: Duration) {
+        self.overall.set_style(
+            ProgressStyle::default_spinner()
+                .template("{msg}")
+                .unwrap(),
+        );
+        self.overall.finish_with_message(format!(
+            "  {} ({}, {:.1}s)",
+            self.filename,
+            format_size(compressed_size),
+            duration.as_secs_f64(),
+        ));
+    }
+}
+
+impl BuildProgress for IndicatifProgress {
+    fn stage_start(&self, stage: BuildStage, total_items: u64, total_bytes: u64) {
+        self.overall
+            .set_message(format!("{}: {}...", self.filename, stage.label()));
+        *self.stage_start_time.lock().unwrap() = Some(Instant::now());
+
+        if total_items > 0 && total_bytes > 0 {
+            let bar = self.multi.add(ProgressBar::new(total_bytes));
+            bar.set_style(
+                ProgressStyle::default_bar()
+                    .template("  {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            *self.detail.lock().unwrap() = Some(bar);
+        }
+    }
+
+    fn item_completed(&self, bytes: u64) {
+        if let Some(ref bar) = *self.detail.lock().unwrap() {
+            bar.inc(bytes);
+        }
+    }
+
+    fn stage_finish(&self, _stage: BuildStage) {
+        if let Some(bar) = self.detail.lock().unwrap().take() {
+            bar.finish_and_clear();
+            self.multi.remove(&bar);
+        }
+        *self.stage_start_time.lock().unwrap() = None;
+    }
+}
+
+/// Print a summary table after all packages are built.
+fn print_build_summary(results: &[BuildResult], total_duration: Duration) {
+    println!();
+    println!("Build Summary");
+    println!("{}", "-".repeat(72));
+
+    for r in results {
+        let ratio = if r.uncompressed_size > 0 {
+            format!(
+                "{:.1}%",
+                (r.compressed_size as f64 / r.uncompressed_size as f64) * 100.0
+            )
+        } else {
+            "n/a".to_string()
+        };
+        println!(
+            "  {} ({} files, {} -> {} [{}], {:.1}s)",
+            r.filename,
+            format_file_count(r.file_count),
+            format_size(r.uncompressed_size),
+            format_size(r.compressed_size),
+            ratio,
+            r.duration.as_secs_f64(),
+        );
+    }
+
+    println!("{}", "-".repeat(72));
+    println!("Total: {:.1}s", total_duration.as_secs_f64());
 }
 
 /// Format a file count with comma separators.

@@ -345,7 +345,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let rpm_path = dir.path().join("test.rpm");
-        RpmBuilder::build(&sub_pkg, &plan, config, &rpm_path, None).unwrap();
+        RpmBuilder::build(&sub_pkg, &plan, config, &rpm_path, None, None).unwrap();
         (rpm_path, dir)
     }
 

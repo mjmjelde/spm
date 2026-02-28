@@ -13,6 +13,9 @@ const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 /// ar member header terminator (file magic).
 const AR_FMAG: &[u8; 2] = b"`\n";
 
+/// Maximum member size representable in the ar header's 10-digit decimal size field.
+const AR_MAX_MEMBER_SIZE: u64 = 9_999_999_999;
+
 /// Writer for ar archives (DEB container format).
 ///
 /// DEB files are ar archives with a specific member ordering:
@@ -103,6 +106,16 @@ impl<W: Write> ArWriter<W> {
     /// - size: 10 bytes (decimal)
     /// - fmag: 2 bytes (`` `\n ``)
     fn write_header(&mut self, name: &str, size: u64, mtime: u64, mode: u32) -> io::Result<()> {
+        if size > AR_MAX_MEMBER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ar member '{name}' size {size} bytes exceeds the ar format \
+                     limit of {AR_MAX_MEMBER_SIZE} bytes (~9.3 GiB); consider enabling \
+                     package splitting to reduce individual package size",
+                ),
+            ));
+        }
         let name_field = format!("{name}/");
         write!(
             self.writer,
@@ -265,6 +278,32 @@ mod tests {
         ar.write_member("empty", b"", 0, 0o100644).unwrap();
         // 8 + 60 = 68 (no data, no padding)
         assert_eq!(buf.len(), 68);
+    }
+
+    #[test]
+    fn test_ar_size_at_limit() {
+        // 9,999,999,999 bytes is exactly 10 digits — should succeed.
+        let mut buf = Vec::new();
+        let mut ar = ArWriter::new(&mut buf);
+        ar.begin_member("big", 9_999_999_999, 0, 0o100644).unwrap();
+        // Verify header is exactly 8 (magic) + 60 (header) = 68 bytes.
+        assert_eq!(buf.len(), 68);
+        // Verify fmag is at correct position.
+        assert_eq!(&buf[66..68], b"`\n");
+    }
+
+    #[test]
+    fn test_ar_size_overflow_rejected() {
+        // 10,000,000,000 bytes is 11 digits — must be rejected.
+        let mut buf = Vec::new();
+        let mut ar = ArWriter::new(&mut buf);
+        let err = ar
+            .begin_member("data.tar.zst", 10_000_000_000, 0, 0o100644)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("9.3 GiB"), "error message: {msg}");
+        assert!(msg.contains("splitting"), "error message: {msg}");
     }
 
     #[test]

@@ -249,7 +249,7 @@ mod tests {
         plan.total_size = plan.sub_packages[0].total_size;
 
         let dir = tempfile::tempdir().unwrap();
-        let paths = DebBuilder::build(&plan, config, dir.path()).unwrap();
+        let paths = DebBuilder::build(&plan, config, dir.path(), None).unwrap();
         (paths[0].clone(), dir)
     }
 

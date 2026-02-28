@@ -34,8 +34,8 @@
 - **`--target-distro`**: parses with `Distro::from_str()`, prints compatibility warnings
 - **`--compression`**, **`--compression-level`**, **`--threads`**: override compression config
 - Shared `apply_overrides()` helper applies all overrides to a cloned `Config`
-- Enhanced `cmd_plan()`: minimum version display (`minimum_rpm_version()` / `minimum_dpkg_version()`), compatibility warnings, `--format all` shows both formats with section headers
-- Enhanced `cmd_build()`: `--format all` builds RPM then DEB sequentially with separate plans (different `FormatLimits`)
+- Enhanced `cmd_plan()`: minimum version display (`minimum_rpm_version()` / `minimum_dpkg_version()`), compatibility warnings, borderline warnings (near format limits or splitting triggered by safety margin), `--format all` shows both formats with section headers
+- Enhanced `cmd_build()`: `--format all` builds RPM then DEB sequentially with separate plans (different `FormatLimits`), `[rpm]`/`[deb]` format headers in progress output
 
 ### spm-cli: `spm inspect` command
 - New `Commands::Inspect { path: PathBuf }` subcommand
@@ -62,14 +62,14 @@
 ## Testing
 
 - **spm-compress**: 18 tests (14 + 4 decompress reader tests)
-- **spm-core**: 84 tests (unchanged)
+- **spm-core**: 89 tests (84 + 5 new planner split/warning tests)
 - **spm-cpio**: 13 tests (unchanged)
 - **spm-deb**: 56 tests (48 + 8 reader tests)
 - **spm-rpm**: 54 tests (44 + 10 reader tests)
-- **Total**: 226 tests (up from 204)
+- **Total**: 233 tests (up from 204)
 
 ```bash
-cargo test --workspace          # 226 tests pass
+cargo test --workspace          # 233 tests pass
 cargo fmt --all -- --check      # no formatting issues
 cargo clippy --all-targets      # no warnings
 ```

@@ -77,11 +77,11 @@ spm-cpio      (standalone, only depends on thiserror)
 - `FileTreeError` — Errors during file tree walking.
 
 **Planning layer:**
-- `PackagePlan` — Complete output of planning: sub-packages, split status, extended cpio flag, total size.
+- `PackagePlan` — Complete output of planning: sub-packages, split status, extended cpio flag, total size, warnings.
 - `SubPackage` — One buildable package (standalone, meta, or part) with its files and scripts.
 - `SubPackageRole` — `Standalone`, `Meta`, `Part(u32)`.
 - `ResolvedScripts` — Script contents with alternatives scriptlets injected.
-- `Planner::plan()` — Creates a package plan from config and format limits.
+- `Planner::plan()` — Creates a package plan from config and format limits. Auto-split uses 80% safety factor and even-parts sizing.
 - `PlanError` — Errors during planning.
 
 **Shared types:**
@@ -128,7 +128,7 @@ spm-cpio      (standalone, only depends on thiserror)
 ### spm-deb
 
 - `DebBuilder::build()` — Full DEB build pipeline: control file → control.tar → data.tar → ar assembly. Handles split packages.
-- `ArWriter<W: Write>` — ar archive writer with reproducible timestamps.
+- `ArWriter<W: Write>` — ar archive writer with reproducible timestamps and member size validation (rejects > 9,999,999,999 bytes).
 - `generate_control()` — Creates RFC 822 control file content.
 - `read_deb_metadata()` — Reads and parses an existing DEB file, returning `DebMetadata` with all control fields.
 - `DebMetadata` — Extracted metadata: ordered `fields: Vec<(String, String)>` with case-insensitive `get()`.

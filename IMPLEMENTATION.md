@@ -597,9 +597,12 @@ impl FormatLimits {
    - Checks `needs_extended_cpio` (any file > 4 GiB)
    - Runs split logic if needed
 5. Implement auto-split algorithm:
-   - Sort files by install path
-   - Accumulate into sub-packages, respecting `max_compressed_payload` with safety margin
+   - Estimate compressed size: `estimated = total_uncompressed × compression_ratio`
+   - Apply 80% safety factor: `safe_limit = format_limit × 0.80` (`AUTO_SPLIT_HEADROOM`)
+   - If `estimated > safe_limit`, calculate even parts: `num_parts = ceil(estimated / safe_limit)`, `max_per_part = total / num_parts`
+   - Sort files by install path, distribute into even-sized parts
    - Generate meta-package entry
+   - Emit borderline warnings when splitting is triggered by safety margin or package is near the limit
 6. Implement alternatives → scriptlet generation (see spec.md §7)
 7. Implement `spm plan` CLI command — runs planner, prints summary matching the format shown in spec.md §9
 8. Implement size-based and directory-based split strategies
@@ -1148,6 +1151,8 @@ impl<W: std::io::Write> ArWriter<W> {
    - When `plan.is_split == true`, build each `SubPackage` as a separate DEB
    - Meta-package DEB has empty `data.tar.zst` but control file with `Depends:` on all parts
    - Each part DEB has its subset of files
+   - ar writer validates member sizes at write time (rejects > 9,999,999,999 bytes)
+   - Even-parts sizing ensures each part stays well under the ar limit
 7. Implement md5sums generation for all files
 8. Wire alternatives auto-dependency injection for DEB (no extra package needed — `update-alternatives` ships with dpkg)
 
