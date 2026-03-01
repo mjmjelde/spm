@@ -446,6 +446,24 @@ impl Config {
                 self.splitting.strategy
             )));
         }
+        if self.splitting.strategy == "size" && self.splitting.max_size.is_none() {
+            return Err(ConfigError::Validation(
+                "splitting.max_size is required when strategy is 'size'".to_string(),
+            ));
+        }
+        if self.splitting.strategy == "directory" && self.splitting.parts.is_empty() {
+            return Err(ConfigError::Validation(
+                "splitting.parts must be non-empty when strategy is 'directory'".to_string(),
+            ));
+        }
+        if let Some(ref max_size) = self.splitting.max_size {
+            crate::types::parse_size(max_size).map_err(|reason| {
+                ConfigError::Validation(format!(
+                    "splitting.max_size '{}' is invalid: {}",
+                    max_size, reason
+                ))
+            })?;
+        }
         Ok(())
     }
 

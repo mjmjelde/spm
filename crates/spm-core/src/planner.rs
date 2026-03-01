@@ -18,6 +18,12 @@ use crate::types::{estimated_compression_ratio, format_size, parse_size, FormatL
 /// ratio is worse than predicted.
 const AUTO_SPLIT_HEADROOM: f64 = 0.80;
 
+/// Fraction of per-part size below which a trailing part is merged back into
+/// the previous part. Greedy bin-packing can leave a tiny remainder when
+/// integer division slightly underestimates the per-part budget; merging
+/// avoids producing a trivially small extra package.
+const TRAILING_PART_MERGE_THRESHOLD: f64 = 0.02;
+
 /// The complete output of the planning phase.
 #[derive(Debug)]
 pub struct PackagePlan {
@@ -140,7 +146,8 @@ impl Planner {
                     }
                 }
                 "size" => {
-                    let max_size_str = config.splitting.max_size.as_deref().unwrap_or("4GiB");
+                    let max_size_str = config.splitting.max_size.as_deref()
+                        .expect("max_size required for size strategy (validated by config)");
                     let max_size =
                         parse_size(max_size_str).map_err(|reason| PlanError::InvalidSize {
                             value: max_size_str.to_string(),
@@ -269,7 +276,8 @@ impl Planner {
                     }
                 }
                 "size" => {
-                    let max_size_str = config.splitting.max_size.as_deref().unwrap_or("4GiB");
+                    let max_size_str = config.splitting.max_size.as_deref()
+                        .expect("max_size required for size strategy (validated by config)");
                     let max_size =
                         parse_size(max_size_str).map_err(|reason| PlanError::InvalidSize {
                             value: max_size_str.to_string(),
@@ -413,36 +421,66 @@ fn split_by_size(
         raw_parts.push((current_files, current_size));
     }
 
-    // Inject required directory entries into each part.
-    // Each part gets directory entries for all ancestor paths of its files.
-    for (part_files, _) in &mut raw_parts {
-        let mut needed_dirs: std::collections::BTreeSet<&Path> =
+    // Merge a trivially small trailing part into the previous part.
+    // Greedy bin-packing with floor-divided budgets can leave a tiny
+    // remainder (e.g. a single 495-byte file) that isn't worth its own
+    // package.
+    if raw_parts.len() >= 2 {
+        let threshold = (max_size_per_part as f64 * TRAILING_PART_MERGE_THRESHOLD) as u64;
+        let last_idx = raw_parts.len() - 1;
+        if raw_parts[last_idx].1 <= threshold {
+            let (trailing_files, trailing_size) = raw_parts.pop().unwrap();
+            let prev = raw_parts.last_mut().unwrap();
+            prev.0.extend(trailing_files);
+            prev.1 += trailing_size;
+        }
+    }
+
+    inject_ancestor_dirs(&mut raw_parts, &dirs);
+
+    raw_parts
+}
+
+/// Inject ancestor directory entries into each split part.
+///
+/// Each part gets directory entries for all ancestor paths of its non-directory
+/// files. Directories are placed before files so that directory entries precede
+/// their children in archive order.
+fn inject_ancestor_dirs(parts: &mut [(Vec<FileEntry>, u64)], dirs: &[FileEntry]) {
+    for (part_files, _) in parts.iter_mut() {
+        let mut needed_dirs: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
         for f in part_files.iter() {
+            if matches!(f.entry_type, EntryType::Directory) {
+                // Track existing directory entries so they're preserved.
+                needed_dirs.insert(f.install_path.clone());
+                continue;
+            }
             let mut p = f.install_path.parent();
             while let Some(ancestor) = p {
                 if ancestor == Path::new("") || ancestor == Path::new("/") {
                     break;
                 }
-                if !needed_dirs.insert(ancestor) {
+                if !needed_dirs.insert(ancestor.to_path_buf()) {
                     break; // already seen this and all its ancestors
                 }
                 p = ancestor.parent();
             }
         }
 
+        // Remove existing directory entries from part_files (we'll re-inject from dirs pool).
+        part_files.retain(|f| !matches!(f.entry_type, EntryType::Directory));
+
         let mut dir_entries: Vec<FileEntry> = Vec::new();
-        for dir in &dirs {
-            if needed_dirs.contains(dir.install_path.as_path()) {
+        for dir in dirs {
+            if needed_dirs.contains(&dir.install_path) {
                 dir_entries.push(dir.clone());
             }
         }
-        // Sort dirs before files so directory entries precede their children.
+        // Dirs before files so directory entries precede their children.
         dir_entries.append(part_files);
         *part_files = dir_entries;
     }
-
-    raw_parts
 }
 
 /// Split files into parts by directory path boundaries.
@@ -451,12 +489,23 @@ fn split_by_directory(
     parts_config: &[crate::config::SplitPart],
     _pkg_name: &str,
 ) -> Vec<(Vec<FileEntry>, u64)> {
+    // Separate directories from non-directory entries.
+    let mut dirs: Vec<FileEntry> = Vec::new();
+    let mut non_dirs: Vec<FileEntry> = Vec::new();
+    for entry in files {
+        if matches!(entry.entry_type, EntryType::Directory) {
+            dirs.push(entry);
+        } else {
+            non_dirs.push(entry);
+        }
+    }
+
     let mut parts: Vec<(Vec<FileEntry>, u64)> =
         parts_config.iter().map(|_| (Vec::new(), 0u64)).collect();
     let mut remainder: Vec<FileEntry> = Vec::new();
     let mut remainder_size: u64 = 0;
 
-    for entry in files {
+    for entry in non_dirs {
         // Find which part this entry belongs to (if any).
         let target_part = parts_config.iter().enumerate().find_map(|(i, part_cfg)| {
             part_cfg
@@ -481,6 +530,12 @@ fn split_by_directory(
     if !remainder.is_empty() {
         parts.push((remainder, remainder_size));
     }
+
+    // Filter out empty parts (configured paths that matched no files).
+    parts.retain(|(files, _)| !files.is_empty());
+
+    // Inject ancestor directory entries into each part.
+    inject_ancestor_dirs(&mut parts, &dirs);
 
     parts
 }
@@ -673,7 +728,9 @@ mod tests {
             .unwrap();
 
         assert!(plan.is_split);
-        assert!(plan.sub_packages.len() > 2); // Meta + at least 2 parts
+        // 30 GiB × 0.35 = 10.5 GiB estimated. Threshold = 9.999G × 0.80 = ~8.0 GiB.
+        // num_parts = ceil(10.5 / 8.0) = 2. So: 1 meta + 2 parts = 3.
+        assert_eq!(plan.sub_packages.len(), 3); // Meta + 2 parts
 
         // First sub-package should be the meta-package.
         assert_eq!(plan.sub_packages[0].role, SubPackageRole::Meta);
@@ -704,13 +761,13 @@ mod tests {
             .unwrap();
 
         assert!(plan.is_split);
-        // 160 MiB / 100 MiB limit = 2 parts.
+        // 160 MiB / 100 MiB limit = 2 parts (a+b in part1, c+d in part2).
         let part_count = plan
             .sub_packages
             .iter()
             .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
             .count();
-        assert!(part_count >= 2);
+        assert_eq!(part_count, 2);
     }
 
     #[test]
@@ -739,13 +796,13 @@ mod tests {
 
         assert!(plan.is_split);
 
-        // Should have: meta + core part + libs part + remainder part.
+        // Should have: meta + core part + libs part + remainder part = 4 total.
         let parts: Vec<_> = plan
             .sub_packages
             .iter()
             .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
             .collect();
-        assert!(parts.len() >= 2);
+        assert_eq!(parts.len(), 3, "expected core + libs + remainder parts");
     }
 
     #[test]
@@ -1068,5 +1125,433 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_hardlink_fixup_cross_part_promotion() {
+        // When a hardlink's target is in a different part, it should be
+        // promoted to a regular file.
+        let mib = 1024 * 1024u64;
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/original.bin", 50 * mib),
+            // Extra file ensures part 2 is above the trailing merge threshold.
+            test_file("/opt/pkg/data.bin", 30 * mib),
+            FileEntry {
+                install_path: PathBuf::from("/opt/pkg/link.bin"),
+                source_path: PathBuf::from("/dev/null"), // exists on disk
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/opt/pkg/original.bin"),
+                },
+                size: 0,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        // Split at 40 MiB. original (50 MiB) goes first (exceeds 40 but is first
+        // file so no split yet). Then data (30 MiB): 50+30=80 > 40 && !empty → split.
+        // Part 2: data (30 MiB) + link (0 bytes). 30 MiB is 75% of 40 MiB → not merged.
+        // original is in part 1, link is in part 2 → cross-part.
+        let mut parts = split_by_size(files, 40 * mib, "testpkg");
+        assert!(parts.len() >= 2, "should have at least 2 parts");
+
+        fixup_hardlinks_across_parts(&mut parts);
+
+        // Link should now be a regular file.
+        let link = parts
+            .iter()
+            .flat_map(|(f, _)| f)
+            .find(|e| e.install_path == Path::new("/opt/pkg/link.bin"))
+            .unwrap();
+        assert!(
+            matches!(link.entry_type, EntryType::RegularFile),
+            "cross-part hardlink should be promoted to RegularFile"
+        );
+    }
+
+    #[test]
+    fn test_hardlink_fixup_same_part_preserved() {
+        // When a hardlink's target is in the same part, it should stay as a hardlink.
+        let mib = 1024 * 1024u64;
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/original.bin", 10 * mib),
+            FileEntry {
+                install_path: PathBuf::from("/opt/pkg/link.bin"),
+                source_path: PathBuf::from("/dev/null"),
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/opt/pkg/original.bin"),
+                },
+                size: 0,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        // Large limit ensures both end up in the same part.
+        let mut parts = split_by_size(files, 100 * mib, "testpkg");
+        assert_eq!(parts.len(), 1, "should be a single part");
+
+        fixup_hardlinks_across_parts(&mut parts);
+
+        let link = parts
+            .iter()
+            .flat_map(|(f, _)| f)
+            .find(|e| e.install_path == Path::new("/opt/pkg/link.bin"))
+            .unwrap();
+        assert!(
+            matches!(link.entry_type, EntryType::Hardlink { .. }),
+            "same-part hardlink should stay as Hardlink"
+        );
+    }
+
+    #[test]
+    fn test_file_distribution_across_size_split() {
+        // Verify that no files are lost or duplicated across parts.
+        let mib = 1024 * 1024u64;
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/a.bin", 30 * mib),
+            test_file("/opt/pkg/b.bin", 30 * mib),
+            test_file("/opt/pkg/c.bin", 30 * mib),
+            test_file("/opt/pkg/d.bin", 30 * mib),
+            test_file("/opt/pkg/e.bin", 30 * mib),
+        ];
+
+        let original_non_dirs: Vec<PathBuf> = files
+            .iter()
+            .filter(|f| !matches!(f.entry_type, EntryType::Directory))
+            .map(|f| f.install_path.clone())
+            .collect();
+
+        let parts = split_by_size(files, 50 * mib, "testpkg");
+
+        // Collect all non-directory files across all parts.
+        let mut distributed: Vec<PathBuf> = parts
+            .iter()
+            .flat_map(|(f, _)| f)
+            .filter(|e| !matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.clone())
+            .collect();
+        distributed.sort();
+        let mut expected = original_non_dirs;
+        expected.sort();
+
+        assert_eq!(
+            distributed, expected,
+            "all non-directory files must appear exactly once across parts"
+        );
+    }
+
+    #[test]
+    fn test_directory_split_ancestor_dirs_in_all_parts() {
+        // Verify that directory-based split injects ancestor directories.
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_dir("/opt/pkg/bin"),
+            test_dir("/opt/pkg/lib"),
+            test_dir("/opt/pkg/share"),
+            test_file("/opt/pkg/bin/tool", 1024),
+            test_file("/opt/pkg/lib/libfoo.so", 2048),
+            test_file("/opt/pkg/share/docs.txt", 512),
+        ];
+
+        let parts_config = vec![
+            SplitPart {
+                name: "core".to_string(),
+                paths: vec!["/opt/pkg/bin".to_string()],
+            },
+            SplitPart {
+                name: "libs".to_string(),
+                paths: vec!["/opt/pkg/lib".to_string()],
+            },
+        ];
+
+        let parts = split_by_directory(files, &parts_config, "testpkg");
+
+        // Should have 3 parts: core, libs, remainder.
+        assert_eq!(parts.len(), 3, "expected core + libs + remainder");
+
+        // Each part should have ancestor directories /opt and /opt/pkg.
+        for (i, (part_files, _)) in parts.iter().enumerate() {
+            let dir_paths: Vec<&Path> = part_files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::Directory))
+                .map(|e| e.install_path.as_path())
+                .collect();
+            assert!(
+                dir_paths.contains(&Path::new("/opt")),
+                "part {i} missing /opt ancestor directory"
+            );
+            assert!(
+                dir_paths.contains(&Path::new("/opt/pkg")),
+                "part {i} missing /opt/pkg ancestor directory"
+            );
+        }
+
+        // Core part should have /opt/pkg/bin directory.
+        let core_dirs: Vec<&Path> = parts[0]
+            .0
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.as_path())
+            .collect();
+        assert!(core_dirs.contains(&Path::new("/opt/pkg/bin")));
+
+        // Libs part should have /opt/pkg/lib directory.
+        let libs_dirs: Vec<&Path> = parts[1]
+            .0
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.as_path())
+            .collect();
+        assert!(libs_dirs.contains(&Path::new("/opt/pkg/lib")));
+    }
+
+    #[test]
+    fn test_directory_split_empty_part_filtered() {
+        // A configured part whose paths match no files should be filtered out.
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_dir("/opt/pkg/bin"),
+            test_file("/opt/pkg/bin/tool", 1024),
+        ];
+
+        let parts_config = vec![
+            SplitPart {
+                name: "core".to_string(),
+                paths: vec!["/opt/pkg/bin".to_string()],
+            },
+            SplitPart {
+                name: "empty".to_string(),
+                paths: vec!["/opt/nonexistent".to_string()],
+            },
+        ];
+
+        let parts = split_by_directory(files, &parts_config, "testpkg");
+
+        // Empty part should be filtered out — only core part remains.
+        assert_eq!(parts.len(), 1, "empty part should be filtered out");
+        let has_tool = parts[0]
+            .0
+            .iter()
+            .any(|e| e.install_path == Path::new("/opt/pkg/bin/tool"));
+        assert!(has_tool, "core part should contain the tool file");
+    }
+
+    #[test]
+    fn test_config_validates_size_strategy_requires_max_size() {
+        let mut config = test_config("testpkg", "size");
+        // max_size is None by default in test_config.
+        assert!(config.splitting.max_size.is_none());
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("max_size is required"),
+            "expected max_size required error, got: {err}"
+        );
+
+        // With max_size set, should pass.
+        config.splitting.max_size = Some("1GiB".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validates_directory_strategy_requires_parts() {
+        let config = test_config("testpkg", "directory");
+        // parts is empty by default in test_config.
+        assert!(config.splitting.parts.is_empty());
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("parts must be non-empty"),
+            "expected parts required error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validates_max_size_format() {
+        let mut config = test_config("testpkg", "auto");
+        config.splitting.max_size = Some("invalid_size".to_string());
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("max_size") && err.contains("invalid"),
+            "expected max_size format error, got: {err}"
+        );
+    }
+
+    // --- Trailing runt merge tests ---
+
+    #[test]
+    fn test_split_by_size_merges_trailing_runt() {
+        // With max_size_per_part = 100, two files of 99 each fill parts 1
+        // and 2 just under the limit, and a 1-byte file would spill into a
+        // would-be part 3. The merge logic should fold it back into part 2.
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/a.bin", 99),
+            test_file("/opt/pkg/b.bin", 99),
+            test_file("/opt/pkg/tiny.txt", 1),
+        ];
+
+        let parts = split_by_size(files, 100, "testpkg");
+
+        assert_eq!(
+            parts.len(),
+            2,
+            "trailing runt part should be merged; got {} parts",
+            parts.len()
+        );
+
+        // The tiny file should be in the last part.
+        let last_non_dirs: Vec<&std::path::Path> = parts
+            .last()
+            .unwrap()
+            .0
+            .iter()
+            .filter(|e| !matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.as_path())
+            .collect();
+        assert!(
+            last_non_dirs
+                .iter()
+                .any(|p| p.ends_with("tiny.txt")),
+            "tiny file should be in the last (merged) part"
+        );
+    }
+
+    #[test]
+    fn test_split_by_size_keeps_large_last_part() {
+        // When the last part is substantial (well above 2% threshold), it
+        // should NOT be merged.
+        let mib = 1024 * 1024u64;
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/a.bin", 80 * mib),
+            test_file("/opt/pkg/b.bin", 80 * mib),
+            test_file("/opt/pkg/c.bin", 60 * mib),
+        ];
+
+        // max = 100 MiB. Part 1: a (80 MiB). Part 2: b (80 MiB). Part 3: c (60 MiB).
+        // 60 MiB is 60% of 100 MiB — well above the 2% threshold.
+        let parts = split_by_size(files, 100 * mib, "testpkg");
+
+        assert_eq!(
+            parts.len(),
+            3,
+            "large last part should NOT be merged; got {} parts",
+            parts.len()
+        );
+    }
+
+    #[test]
+    fn test_split_by_size_merge_preserves_all_files() {
+        // Verify that merging the trailing part does not lose any files.
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_file("/opt/pkg/a.bin", 90),
+            test_file("/opt/pkg/b.bin", 90),
+            test_file("/opt/pkg/c.bin", 1),
+            test_file("/opt/pkg/d.bin", 1),
+        ];
+
+        let original_non_dirs: Vec<std::path::PathBuf> = files
+            .iter()
+            .filter(|f| !matches!(f.entry_type, EntryType::Directory))
+            .map(|f| f.install_path.clone())
+            .collect();
+
+        let parts = split_by_size(files, 100, "testpkg");
+
+        let mut distributed: Vec<std::path::PathBuf> = parts
+            .iter()
+            .flat_map(|(f, _)| f)
+            .filter(|e| !matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.clone())
+            .collect();
+        distributed.sort();
+        let mut expected = original_non_dirs;
+        expected.sort();
+
+        assert_eq!(
+            distributed, expected,
+            "all files must be preserved after trailing merge"
+        );
+    }
+
+    #[test]
+    fn test_auto_split_no_trailing_runt_part() {
+        // Reproduce the Matlab bug: total size causes num_parts=2 but
+        // greedy packing leaves a tiny file in a would-be part 3.
+        let config = test_config("matlab", "auto");
+        let limits = FormatLimits::deb();
+
+        // DEB safe_limit ≈ 8 GiB. With ZSTD ratio 0.35:
+        //   total = 24 GiB + 495 B → est_compressed ≈ 8.4 GiB → num_parts = 2
+        //   per_part = (24 GiB + 495) / 2 ≈ 12 GiB
+        // 8 chunks of 3 GiB fill 2 parts evenly, leaving the 495-byte file.
+        let gib = 1024 * 1024 * 1024u64;
+        let chunk = 3 * gib;
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/matlab"),
+            test_file("/opt/matlab/part_a1", chunk),
+            test_file("/opt/matlab/part_a2", chunk),
+            test_file("/opt/matlab/part_a3", chunk),
+            test_file("/opt/matlab/part_a4", chunk),
+            test_file("/opt/matlab/part_b1", chunk),
+            test_file("/opt/matlab/part_b2", chunk),
+            test_file("/opt/matlab/part_b3", chunk),
+            test_file("/opt/matlab/part_b4", chunk),
+            test_file("/opt/matlab/tiny_leftover.txt", 495),
+        ];
+
+        let plan = Planner::plan_from_entries(
+            &config,
+            &limits,
+            files,
+            ResolvedScripts::default(),
+        )
+        .unwrap();
+
+        assert!(plan.is_split);
+
+        let data_parts: Vec<_> = plan
+            .sub_packages
+            .iter()
+            .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
+            .collect();
+
+        assert_eq!(
+            data_parts.len(),
+            2,
+            "expected 2 data parts (no trailing runt), got {}",
+            data_parts.len()
+        );
+
+        // The tiny file must not be lost.
+        let has_tiny = data_parts.iter().any(|sp| {
+            sp.files
+                .iter()
+                .any(|f| f.install_path.ends_with("tiny_leftover.txt"))
+        });
+        assert!(has_tiny, "tiny file must not be lost during merge");
     }
 }

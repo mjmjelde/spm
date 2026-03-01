@@ -16,7 +16,7 @@ use spm_compress::{compress_writer, Algorithm, CompressorConfig};
 use spm_core::config::Config;
 use spm_core::distro::{Distro, DistroInfo};
 use spm_core::filetree::{EntryType, FileEntry};
-use spm_core::planner::{PackagePlan, SubPackage};
+use spm_core::planner::{PackagePlan, SubPackage, SubPackageRole};
 use spm_core::progress::{BuildProgress, BuildStage, NoopProgress};
 use spm_cpio::{CpioFormat, CpioMetadata, CpioWriter};
 
@@ -177,9 +177,8 @@ fn build_metadata_header(
         config,
         algorithm,
         target_distro,
-        &sub_package.name,
-        &plan.version,
-        &plan.release,
+        sub_package,
+        plan,
     )?;
     add_scripts(&mut hdr, &sub_package.scripts)?;
 
@@ -448,10 +447,13 @@ fn add_dependencies(
     config: &Config,
     algorithm: &Algorithm,
     target_distro: Option<&Distro>,
-    pkg_name: &str,
-    pkg_version: &str,
-    pkg_release: &str,
+    sub_package: &SubPackage,
+    plan: &PackagePlan,
 ) -> Result<(), RpmError> {
+    let pkg_name = &sub_package.name;
+    let pkg_version = &plan.version;
+    let pkg_release = &plan.release;
+
     let mut names: Vec<String> = Vec::new();
     let mut versions: Vec<String> = Vec::new();
     let mut flags: Vec<i32> = Vec::new();
@@ -489,6 +491,17 @@ fn add_dependencies(
         names.push(name);
         versions.push(version);
         flags.push(dep_flags);
+    }
+
+    // Meta-package: auto-depend on all part sub-packages.
+    if sub_package.role == SubPackageRole::Meta {
+        for sp in &plan.sub_packages {
+            if matches!(sp.role, SubPackageRole::Part(_)) {
+                names.push(sp.name.clone());
+                versions.push(format!("{pkg_version}-{pkg_release}"));
+                flags.push(RPMSENSE_EQUAL as i32);
+            }
+        }
     }
 
     // Alternatives auto-dependency injection.
@@ -1115,13 +1128,39 @@ mod tests {
         assert!(data_str.contains("echo posttrans"));
     }
 
+    fn make_standalone_sub_pkg() -> SubPackage {
+        SubPackage {
+            name: "testpkg".into(),
+            role: SubPackageRole::Standalone,
+            files: vec![],
+            total_size: 0,
+            scripts: spm_core::alternatives::ResolvedScripts::default(),
+        }
+    }
+
+    fn make_standalone_plan() -> PackagePlan {
+        PackagePlan {
+            name: "testpkg".into(),
+            version: "1.0".into(),
+            release: "1".into(),
+            arch: "x86_64".into(),
+            sub_packages: vec![],
+            is_split: false,
+            needs_extended_cpio: false,
+            total_size: 0,
+            warnings: vec![],
+        }
+    }
+
     #[test]
     fn test_conflicts_emitted() {
         let mut config = make_test_config();
         config.package.dependencies.conflicts = vec!["otherpkg >= 2.0".into()];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1134,7 +1173,9 @@ mod tests {
         config.package.dependencies.replaces = vec!["oldpkg < 1.0".into()];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1153,7 +1194,9 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8), "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8), &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1172,7 +1215,9 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9), "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9), &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1191,7 +1236,9 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1203,7 +1250,9 @@ mod tests {
         let config = make_test_config();
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
+        let sub_pkg = make_standalone_sub_pkg();
+        let plan = make_standalone_plan();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, &sub_pkg, &plan).unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);

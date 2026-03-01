@@ -292,9 +292,9 @@ splitting:
   enabled: true
   # Strategy: "auto" (respect format limits), "size" (explicit max), "directory" (split by path)
   strategy: auto
-  # For strategy = "size": maximum uncompressed size per sub-package
+  # For strategy = "size": maximum uncompressed size per sub-package (REQUIRED)
   # max_size: 8GiB
-  # For strategy = "directory": split boundaries
+  # For strategy = "directory": split boundaries (at least one part REQUIRED)
   # parts:
   #   - name: matlab-core
   #     paths: [/opt/matlab/R2025a/bin, /opt/matlab/R2025a/sys]
@@ -345,6 +345,15 @@ spm validates `package.name` and `package.version` at config load time:
 - **Version:** Must match `[0-9][^\s:]*` — starts with a digit, contains no whitespace or colons. Colons conflict with the epoch separator in both RPM and DEB version schemes.
 
 Invalid names/versions produce a `ConfigError::InvalidPackageName` or `ConfigError::InvalidPackageVersion` error at parse time, before any planning or building occurs.
+
+### 3.5 Splitting Config Validation
+
+The following constraints are enforced at config validation time (before planning):
+
+- **`splitting.strategy`** must be one of: `auto`, `size`, `directory`
+- **`splitting.max_size`** is required when `strategy` is `size` — omitting it is a validation error (no implicit default)
+- **`splitting.parts`** must be non-empty when `strategy` is `directory` — an empty parts list is a validation error
+- **`splitting.max_size`** format (e.g., `"4GiB"`, `"500MiB"`) is validated at config time via `parse_size()` — invalid size strings like `"8ZB"` or `""` produce an immediate error rather than failing later during planning
 
 ---
 
@@ -436,17 +445,23 @@ Each part package:
 
 #### `size` — Explicit Size Limit
 
-User specifies a maximum per-package size. Useful when you know your repo or transport has size constraints even if the format doesn't.
+User specifies a maximum per-package size. Useful when you know your repo or transport has size constraints even if the format doesn't. The `max_size` field is **required** when using this strategy — config validation rejects `strategy: size` without it.
 
 ```yaml
 splitting:
   strategy: size
-  max_size: 4GiB    # supports B, KiB, MiB, GiB, TiB
+  max_size: 4GiB    # supports B, KiB, MiB, GiB, TiB (required)
 ```
+
+The `max_size` value is validated at config load time (not deferred to planning). Invalid size strings produce a clear config validation error.
 
 #### `directory` — Split by Path Boundaries
 
-User specifies directory boundaries for splitting. Each boundary becomes a separate sub-package.
+User specifies directory boundaries for splitting. Each boundary becomes a separate sub-package. The `parts` list is **required** and must be non-empty when using this strategy.
+
+Files that don't match any configured part go into an automatically generated remainder part. Configured parts whose paths match no files are silently filtered out (no empty packages are produced).
+
+Each part receives ancestor directory entries for all of its files — e.g., a part containing `/opt/app/bin/tool` will also include directory entries for `/opt/`, `/opt/app/`, and `/opt/app/bin/`, even if those directories weren't explicitly matched by the part's path prefixes.
 
 ```yaml
 splitting:
@@ -1094,7 +1109,7 @@ strategy:
 
 4. **DEB splitting and conffiles:** When splitting, config files should always go in the meta-package (or a specific part). Need to define this clearly.
 
-5. **Hardlinks across split boundaries:** If a hardlink group spans two sub-packages, each part must include a full copy. The planner must account for this.
+5. ~~**Hardlinks across split boundaries:**~~ **Resolved.** `fixup_hardlinks_across_parts()` detects hardlinks whose target is in a different part and promotes them to regular files with their actual size. The part's `total_size` is adjusted upward accordingly (may exceed the original split target, which is acceptable — the alternative is a broken package).
 
 6. **Alternatives in split packages:** When auto-splitting is active, the alternatives scriptlets should be injected into the **meta-package** (not the parts), since the meta-package is what the user installs/removes. The alternative's `path` must point to a file that lives in one of the parts, so the meta-package's dependency on that part ensures the binary exists. Need to validate this ordering works correctly with both dpkg and rpm transaction ordering.
 

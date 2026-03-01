@@ -148,6 +148,42 @@ Codebase-wide audit across all 6 crates; 12 fixes applied (236 total tests, all 
 - Added clarifying comment on hardlink size adjustment in `fixup_hardlinks_across_parts()`
 - Eliminated unnecessary `.clone()` in `split_by_directory()` by restructuring to move entries
 
+### Fix: Auto-split trailing runt part
+
+- Fixed `split_by_size` producing a trivially small trailing part when greedy bin-packing
+  with floor-divided per-part budgets leaves a tiny remainder (e.g. a single 495-byte file
+  in its own multi-GiB package). Trailing parts under 2% of the per-part target are now
+  merged back into the previous part.
+- 4 new tests (248 total)
+
+### Deep Analysis: Package Splitting Logic (Round 3)
+
+Focused audit of the package splitting subsystem across planner, builders, and config validation;
+3 bugs fixed, 3 config validation gaps closed, 18 new tests (244 total).
+
+**Bugs fixed:**
+- Fixed `split_by_directory` not injecting ancestor directory entries into parts — parts could
+  be missing `/opt`, `/opt/pkg`, etc., causing package manager warnings or incorrect permissions.
+  Extracted shared `inject_ancestor_dirs()` helper used by both `split_by_size` and
+  `split_by_directory`.
+- Fixed RPM meta-package missing `Requires` on part sub-packages — DEB correctly injected
+  `Depends` for meta-packages, but RPM's `add_dependencies()` did not, so installing an RPM
+  meta-package would not pull in its parts. Now injects `Requires: {part} = {version}-{release}`
+  with `RPMSENSE_EQUAL` flags.
+- Fixed `split_by_directory` producing empty sub-packages when configured paths matched no files —
+  empty parts are now filtered out before building sub-packages.
+
+**Config validation improvements:**
+- `strategy: size` now requires `max_size` — previously silently defaulted to `"4GiB"`
+- `strategy: directory` now requires non-empty `parts` — previously silently treated as standalone
+- `max_size` format validated at config time via `parse_size()` — previously deferred to planning
+
+**Test improvements:**
+- Strengthened 3 weak assertions (changed `>=` to exact part counts)
+- Added tests: cross-part hardlink promotion, same-part hardlink preservation, file distribution
+  integrity, directory-based split ancestor directory injection, empty part filtering, 3 config
+  validation tests
+
 ### Phase 5b: CLI Integration — Build Flags, Inspect, Spinners
 
 - Added `decompress_reader()` to `spm-compress` for unified decompression (Zstd, Gzip, Xz, None)
