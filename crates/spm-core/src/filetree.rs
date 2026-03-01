@@ -68,6 +68,13 @@ impl FileTree {
 
         // Process symlinks from config.
         for sym in &content.symlinks {
+            if sym.src.is_empty() {
+                return Err(FileTreeError::InvalidMapping {
+                    src: sym.src.clone(),
+                    dst: sym.dst.clone(),
+                    reason: "symlink target must not be empty".into(),
+                });
+            }
             let install_path = PathBuf::from(&sym.dst);
             if seen_install_paths.insert(install_path.clone()) {
                 entries.push(FileEntry {

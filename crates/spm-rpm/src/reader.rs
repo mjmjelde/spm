@@ -38,13 +38,14 @@ pub struct RpmMetadata {
 
 /// A parsed tag value from an RPM header.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum ParsedTagValue {
     String(String),
     StringArray(Vec<String>),
     Int32(Vec<i32>),
     Int64(Vec<i64>),
+    #[allow(dead_code)]
     Int16(Vec<i16>),
+    #[allow(dead_code)]
     Bin(Vec<u8>),
 }
 

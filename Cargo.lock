@@ -742,6 +742,7 @@ dependencies = [
  "anyhow",
  "clap",
  "indicatif",
+ "spm-compress",
  "spm-core",
  "spm-deb",
  "spm-rpm",

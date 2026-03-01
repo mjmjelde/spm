@@ -457,24 +457,21 @@ fn split_by_directory(
     let mut remainder_size: u64 = 0;
 
     for entry in files {
-        let install_str = entry.install_path.to_string_lossy();
-        let mut assigned = false;
+        // Find which part this entry belongs to (if any).
+        let target_part = parts_config.iter().enumerate().find_map(|(i, part_cfg)| {
+            part_cfg
+                .paths
+                .iter()
+                // Use Path::starts_with for component-aware matching so that
+                // e.g. "/opt/pkg" does NOT match "/opt/pkg2/file".
+                .any(|prefix| entry.install_path.starts_with(prefix))
+                .then_some(i)
+        });
 
-        for (i, part_cfg) in parts_config.iter().enumerate() {
-            for prefix in &part_cfg.paths {
-                if install_str.starts_with(prefix) {
-                    parts[i].1 += entry.size;
-                    parts[i].0.push(entry.clone());
-                    assigned = true;
-                    break;
-                }
-            }
-            if assigned {
-                break;
-            }
-        }
-
-        if !assigned {
+        if let Some(i) = target_part {
+            parts[i].1 += entry.size;
+            parts[i].0.push(entry);
+        } else {
             remainder_size += entry.size;
             remainder.push(entry);
         }
@@ -490,6 +487,11 @@ fn split_by_directory(
 
 /// When files are split across parts, hardlinks whose target is in a different
 /// part must be converted to regular files with their actual size restored.
+///
+/// Note: `total_size` per part is adjusted upward when a hardlink (which
+/// contributed 0 bytes during splitting) is promoted to a regular file.
+/// This means the part's total_size may exceed the original split target,
+/// which is acceptable — the alternative is a broken package.
 fn fixup_hardlinks_across_parts(parts: &mut [(Vec<FileEntry>, u64)]) {
     use std::collections::HashSet;
 

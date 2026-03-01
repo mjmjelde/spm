@@ -1,6 +1,6 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -20,10 +20,6 @@ struct Cli {
     /// Config file path
     #[arg(short, long, global = true, default_value = "spm.yaml")]
     config: PathBuf,
-
-    /// Increase verbosity (-v, -vv, -vvv)
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
-    verbose: u8,
 
     /// Suppress non-error output
     #[arg(short, long, global = true)]
@@ -184,7 +180,7 @@ fn apply_overrides(
     compression: Option<&str>,
     compression_level: Option<i32>,
     threads: Option<usize>,
-) {
+) -> Result<()> {
     if no_split {
         config.splitting.enabled = false;
     }
@@ -201,6 +197,9 @@ fn apply_overrides(
     }
 
     if let Some(algo) = compression {
+        // Validate early so `spm plan` catches invalid algorithms too.
+        spm_compress::Algorithm::from_str(algo)
+            .map_err(|_| anyhow::anyhow!("unsupported compression algorithm '{algo}'; expected 'zstd', 'gzip', 'xz', or 'none'"))?;
         config.compression.algorithm = algo.to_string();
     }
     if let Some(level) = compression_level {
@@ -209,6 +208,8 @@ fn apply_overrides(
     if let Some(t) = threads {
         config.compression.threads = Some(t);
     }
+
+    Ok(())
 }
 
 /// Parse --target-distro flag value into a Distro.
@@ -283,7 +284,7 @@ fn cmd_plan(
         compression,
         compression_level,
         threads,
-    );
+    )?;
 
     let distro = parse_target_distro(target_distro)?;
     let formats = resolve_formats(format)?;
@@ -406,7 +407,7 @@ fn cmd_plan(
         }
 
         println!();
-        println!("  Output: out/{output_filename}");
+        println!("  Output: ./out/{output_filename}");
     }
 
     Ok(())
@@ -436,7 +437,7 @@ fn cmd_build(
         compression,
         compression_level,
         threads,
-    );
+    )?;
 
     let distro = parse_target_distro(target_distro)?;
     let formats = resolve_formats(format)?;
@@ -677,8 +678,8 @@ struct IndicatifProgress {
     multi: MultiProgress,
     overall: ProgressBar,
     filename: String,
-    detail: Mutex<Option<ProgressBar>>,
-    stage_start_time: Mutex<Option<Instant>>,
+    detail: RefCell<Option<ProgressBar>>,
+    stage_start_time: RefCell<Option<Instant>>,
 }
 
 impl IndicatifProgress {
@@ -696,8 +697,8 @@ impl IndicatifProgress {
             multi: multi.clone(),
             overall,
             filename: filename.to_string(),
-            detail: Mutex::new(None),
-            stage_start_time: Mutex::new(None),
+            detail: RefCell::new(None),
+            stage_start_time: RefCell::new(None),
         }
     }
 
@@ -721,7 +722,7 @@ impl BuildProgress for IndicatifProgress {
     fn stage_start(&self, stage: BuildStage, total_items: u64, total_bytes: u64) {
         self.overall
             .set_message(format!("{}: {}...", self.filename, stage.label()));
-        *self.stage_start_time.lock().unwrap() = Some(Instant::now());
+        *self.stage_start_time.borrow_mut() = Some(Instant::now());
 
         if total_items > 0 && total_bytes > 0 {
             let bar = self.multi.add(ProgressBar::new(total_bytes));
@@ -731,22 +732,22 @@ impl BuildProgress for IndicatifProgress {
                     .unwrap()
                     .progress_chars("##-"),
             );
-            *self.detail.lock().unwrap() = Some(bar);
+            *self.detail.borrow_mut() = Some(bar);
         }
     }
 
     fn item_completed(&self, bytes: u64) {
-        if let Some(ref bar) = *self.detail.lock().unwrap() {
+        if let Some(ref bar) = *self.detail.borrow() {
             bar.inc(bytes);
         }
     }
 
     fn stage_finish(&self, _stage: BuildStage) {
-        if let Some(bar) = self.detail.lock().unwrap().take() {
+        if let Some(bar) = self.detail.borrow_mut().take() {
             bar.finish_and_clear();
             self.multi.remove(&bar);
         }
-        *self.stage_start_time.lock().unwrap() = None;
+        *self.stage_start_time.borrow_mut() = None;
     }
 }
 

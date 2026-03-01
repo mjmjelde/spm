@@ -993,7 +993,7 @@ mod tests {
                 }
             }
         }
-        panic!("control file not found in DEB");
+        unreachable!("control file not found in DEB archive");
     }
 
     /// Helper: extract the raw data tar content from a DEB.
@@ -1004,7 +1004,7 @@ mod tests {
                 return decompress_tar_member(name, data);
             }
         }
-        panic!("data.tar not found in DEB");
+        unreachable!("data.tar not found in DEB archive");
     }
 
     /// Parse ar archive into (name, data) pairs.

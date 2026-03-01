@@ -48,6 +48,7 @@ spm/
 
 ```
 spm-cli ──► spm-core
+        ├─► spm-compress  (for early algorithm validation)
         ├─► spm-rpm ──► spm-core
         │            ├─► spm-cpio
         │            └─► spm-compress
@@ -141,4 +142,5 @@ spm-cpio      (standalone, only depends on thiserror)
 - `cmd_build()` — Loads config, applies overrides, creates package plan, builds RPM/DEB/both for each sub-package with progress spinners.
 - `cmd_plan()` — Shows build plan with minimum version requirements and distro compatibility warnings.
 - `cmd_inspect()` — Reads and displays metadata from existing .rpm or .deb files.
-- `apply_overrides()` — Shared helper for CLI flag → config mutation (splitting, compression, source_date_epoch).
+- `apply_overrides()` — Shared helper for CLI flag → config mutation (splitting, compression, source_date_epoch). Returns `Result` — validates compression algorithm early via `spm_compress::Algorithm::from_str()`.
+- `IndicatifProgress` — Per-package progress reporter using `RefCell` for interior mutability (single-threaded).

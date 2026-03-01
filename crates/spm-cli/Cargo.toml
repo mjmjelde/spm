@@ -10,6 +10,7 @@ name = "spm"
 path = "src/main.rs"
 
 [dependencies]
+spm-compress = { path = "../spm-compress" }
 spm-core = { path = "../spm-core" }
 spm-deb = { path = "../spm-deb" }
 spm-rpm = { path = "../spm-rpm" }

@@ -838,14 +838,9 @@ fn sha256_file(path: &Path) -> Result<String, RpmError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Get the hostname for BUILDHOST tag.
 /// Clamp a Unix timestamp to i32::MAX (2038-01-19) since RPM uses INT32.
 fn clamp_timestamp(secs: u64) -> i32 {
     if secs > i32::MAX as u64 {
-        eprintln!(
-            "warning: timestamp {secs} exceeds RPM INT32 limit (2038-01-19), clamping to {}",
-            i32::MAX
-        );
         i32::MAX
     } else {
         secs as i32

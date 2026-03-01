@@ -888,7 +888,6 @@ COMMANDS:
 
 GLOBAL OPTIONS:
     -c, --config <FILE>      Config file path [default: spm.yaml]
-    -v, --verbose            Increase verbosity (-v, -vv, -vvv)
     -q, --quiet              Suppress non-error output
     --color <WHEN>           Color output: auto, always, never [default: auto]
 ```

@@ -219,7 +219,7 @@ mod tests {
                 assert!(rpm.supports_large_files);
                 assert_eq!(rpm.alternatives_dep, "chkconfig");
             }
-            DistroInfo::Deb(_) => panic!("expected RPM info for el8"),
+            _ => unreachable!("expected RPM info for el8"),
         }
     }
 
@@ -231,7 +231,7 @@ mod tests {
                 assert_eq!(rpm.rpm_version, "4.16.1");
                 assert_eq!(rpm.alternatives_dep, "alternatives");
             }
-            DistroInfo::Deb(_) => panic!("expected RPM info for el9"),
+            _ => unreachable!("expected RPM info for el9"),
         }
     }
 
@@ -243,7 +243,7 @@ mod tests {
                 assert_eq!(deb.dpkg_version, "1.21.1");
                 assert!(deb.supports_zstd);
             }
-            DistroInfo::Rpm(_) => panic!("expected DEB info for ubuntu2204"),
+            _ => unreachable!("expected DEB info for ubuntu2204"),
         }
     }
 

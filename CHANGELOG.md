@@ -120,6 +120,34 @@ Comprehensive codebase audit identified ~60 issues; 25 fixes implemented with 10
 - Added header data offset overflow check (`> i32::MAX`)
 - Added package name/version format validation at config load time
 
+### Deep Analysis: Correctness and Quality Improvements (Round 2)
+
+Codebase-wide audit across all 6 crates; 12 fixes applied (236 total tests, all passing).
+
+**Correctness-critical:**
+- Fixed directory-split path prefix matching — was using string `starts_with()` which caused
+  `/opt/pkg` to incorrectly match `/opt/pkg2/file`; now uses `Path::starts_with()` for
+  component-aware matching
+- Added empty symlink target validation in `filetree.rs` — symlinks with empty `src` now
+  produce a clear `InvalidMapping` error instead of silently creating broken entries
+
+**CLI improvements:**
+- Removed unused `--verbose` (`-v`) flag that was accepted but ignored
+- `apply_overrides()` now validates compression algorithm early via `Algorithm::from_str()`,
+  so `spm plan` catches invalid `--compression` values (not just `spm build`)
+- Added `spm-compress` as direct dependency of `spm-cli` for early validation
+- Fixed plan output path from `out/` to `./out/` for consistency with build default
+
+**Code quality:**
+- Replaced `Mutex` with `RefCell` in `IndicatifProgress` — single-threaded code doesn't need
+  mutex overhead or poisoning risk
+- Removed `eprintln!()` from RPM library code (`clamp_timestamp()`) — library crates should
+  not write to stderr
+- Replaced `panic!()` with `unreachable!()` in test helpers for clearer intent
+- Narrowed `#[allow(dead_code)]` to specific unused `ParsedTagValue` variants
+- Added clarifying comment on hardlink size adjustment in `fixup_hardlinks_across_parts()`
+- Eliminated unnecessary `.clone()` in `split_by_directory()` by restructuring to move entries
+
 ### Phase 5b: CLI Integration — Build Flags, Inspect, Spinners
 
 - Added `decompress_reader()` to `spm-compress` for unified decompression (Zstd, Gzip, Xz, None)
