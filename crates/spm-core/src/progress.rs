@@ -53,6 +53,12 @@ pub trait BuildProgress {
 
     /// The current stage has finished.
     fn stage_finish(&self, stage: BuildStage);
+
+    /// A split part has been finalized during streaming split.
+    ///
+    /// `part` is the 1-based part number. `compressed_size` is the
+    /// compressed data.tar size for this part.
+    fn part_completed(&self, _part: u32, _compressed_size: u64) {}
 }
 
 /// A no-op implementation that discards all progress updates.

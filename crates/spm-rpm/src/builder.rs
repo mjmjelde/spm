@@ -1059,6 +1059,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: 0,
             warnings: vec![],
+            deferred_split: false,
         };
         let sub_pkg = SubPackage {
             name: "testpkg".into(),
@@ -1091,6 +1092,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: 0,
             warnings: vec![],
+            deferred_split: false,
         };
         let sub_pkg = SubPackage {
             name: "testpkg".into(),
@@ -1149,6 +1151,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: 0,
             warnings: vec![],
+            deferred_split: false,
         }
     }
 

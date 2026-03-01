@@ -14,9 +14,10 @@ use tar::{Builder as TarBuilder, EntryType as TarEntryType, Header as TarHeader}
 use spm_compress::{compress_writer, Algorithm, CompressorConfig};
 use spm_core::config::Config;
 use spm_core::filetree::{EntryType, FileEntry};
-use spm_core::planner::{PackagePlan, SubPackage, SubPackageRole};
+use spm_core::alternatives::ResolvedScripts;
+use spm_core::planner::{HardlinkFamilies, PackagePlan, SubPackage, SubPackageRole};
 use spm_core::progress::{BuildProgress, BuildStage, NoopProgress};
-use spm_core::types::PackageFileName;
+use spm_core::types::{FormatLimits, PackageFileName};
 
 use crate::ar::ArWriter;
 use crate::control;
@@ -36,6 +37,11 @@ impl DebBuilder {
         output_dir: &Path,
         progress: Option<&dyn BuildProgress>,
     ) -> Result<Vec<PathBuf>, DebError> {
+        // Deferred split: the builder monitors actual compressed sizes.
+        if plan.deferred_split {
+            return build_streaming_split(plan, config, output_dir, progress);
+        }
+
         let noop = NoopProgress;
         let prog: &dyn BuildProgress = progress.unwrap_or(&noop);
 
@@ -124,6 +130,336 @@ pub fn build_single_deb(
     ar.finish_member()?;
 
     // data.tar.{ext} member.
+    let data_name = format!("data.tar{compress_ext}");
+    ar.begin_member(&data_name, data_size, mtime, 0o100644)?;
+    let mut data_file = File::open(data_tmp.path())?;
+    io::copy(&mut data_file, ar.writer_mut())?;
+    ar.finish_member()?;
+
+    ar.finish()?;
+    progress.stage_finish(BuildStage::Assembling);
+    Ok(())
+}
+
+/// Result of building one split part during streaming split.
+struct StreamingPartResult {
+    /// The temp file containing the compressed data.tar.
+    data_tmp: tempfile::NamedTempFile,
+    /// Compressed size of data.tar.
+    data_size: u64,
+    /// Files included in this part (for control file generation).
+    files: Vec<FileEntry>,
+    /// Total uncompressed size of files in this part.
+    total_size: u64,
+}
+
+/// Threshold factor for streaming split. The builder splits when the actual
+/// compressed data.tar size reaches 95% of the ar member limit. The 5% margin
+/// covers the control.tar member, ar headers, debian-binary, and any residual
+/// compressor buffering not yet flushed.
+const STREAMING_SPLIT_HEADROOM: f64 = 0.95;
+
+/// Only flush the compressor and check compressed size every this many
+/// uncompressed bytes. Flushing zstd forces a block boundary via
+/// ZSTD_flushStream, which is expensive at high compression levels and
+/// degrades both speed and compression ratio when called too frequently.
+/// 256 MiB gives ~90 MiB of compressed-size granularity at typical ratios,
+/// well within the 5% split headroom (~500 MiB).
+const FLUSH_INTERVAL: u64 = 256 * 1024 * 1024;
+
+/// Build DEB packages using monitored streaming split.
+///
+/// Instead of pre-splitting files by estimated compression ratios, this streams
+/// all files through tar → compressor → temp file, periodically checking the
+/// actual compressed output size. When the threshold is reached, the current
+/// part is finalized and a new one begins.
+pub fn build_streaming_split(
+    plan: &PackagePlan,
+    config: &Config,
+    output_dir: &Path,
+    progress: Option<&dyn BuildProgress>,
+) -> Result<Vec<PathBuf>, DebError> {
+    let noop = NoopProgress;
+    let prog: &dyn BuildProgress = progress.unwrap_or(&noop);
+
+    std::fs::create_dir_all(output_dir)?;
+
+    let algorithm = resolve_algorithm(config)?;
+    let compressor_config = make_compressor_config(&algorithm, config);
+    let compress_ext = match algorithm {
+        Algorithm::None => String::new(),
+        _ => format!(".{}", algorithm.extension()),
+    };
+    let mtime = resolve_mtime(config);
+
+    // The single SubPackage containing all files.
+    let all_files = &plan.sub_packages[0].files;
+    let scripts = &plan.sub_packages[0].scripts;
+
+    let threshold =
+        (FormatLimits::deb().max_compressed_payload as f64 * STREAMING_SPLIT_HEADROOM) as u64;
+
+    // Pre-scan hardlink families so targets and their links stay in the same part.
+    let families = HardlinkFamilies::scan(all_files);
+
+    // Track which file indices have been included (for hardlink skip logic).
+    let mut included = vec![false; all_files.len()];
+
+    // Collect directory entries — written at the start of each part's tar.
+    let dir_entries: Vec<&FileEntry> = all_files
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.entry_type, EntryType::Directory))
+        .map(|(i, e)| {
+            included[i] = true;
+            e
+        })
+        .collect();
+
+    let file_count = all_files.len() as u64;
+    let total_bytes = plan.total_size;
+    prog.stage_start(BuildStage::WritingPayload, file_count, total_bytes);
+
+    let mut parts: Vec<StreamingPartResult> = Vec::new();
+    let mut current_files: Vec<FileEntry> = Vec::new();
+    let mut current_size: u64 = 0;
+    let mut bytes_since_flush: u64 = 0;
+
+    // Start first part.
+    let mut data_tmp = tempfile::NamedTempFile::new()?;
+    let mut compressor = compress_writer(&compressor_config, &data_tmp)?;
+    let mut tar = TarBuilder::new(compressor);
+
+    // Write all directory entries to the first part's tar.
+    for dir in &dir_entries {
+        write_tar_entry(&mut tar, dir, mtime)?;
+    }
+
+    for (i, entry) in all_files.iter().enumerate() {
+        // Skip directories (already written) and hardlinks (pulled in with target).
+        if included[i] {
+            continue;
+        }
+
+        // Write this entry.
+        write_tar_entry(&mut tar, entry, mtime)?;
+        prog.item_completed(entry.size);
+        included[i] = true;
+        current_files.push(entry.clone());
+        current_size += entry.size;
+        bytes_since_flush += entry.size;
+
+        // If this file is a hardlink target, pull in all its links immediately.
+        if let Some(link_indices) = families.links_for_target(&entry.install_path) {
+            for &li in link_indices {
+                if !included[li] {
+                    let link_entry = &all_files[li];
+                    write_tar_entry(&mut tar, link_entry, mtime)?;
+                    prog.item_completed(link_entry.size);
+                    included[li] = true;
+                    current_files.push(link_entry.clone());
+                    current_size += link_entry.size;
+                    bytes_since_flush += link_entry.size;
+                }
+            }
+        }
+
+        // Periodically flush compressor and check actual compressed size.
+        // We avoid flushing after every file because ZSTD_flushStream forces
+        // a block boundary, which is expensive at high compression levels and
+        // degrades both speed and compression ratio.
+        if bytes_since_flush >= FLUSH_INTERVAL {
+            tar.get_mut().flush()?;
+            let compressed_so_far = std::fs::metadata(data_tmp.path())?.len();
+            bytes_since_flush = 0;
+
+            if compressed_so_far >= threshold {
+                // Finalize this part.
+                compressor = tar
+                    .into_inner()
+                    .map_err(|e| DebError::Tar(e.to_string()))?;
+                compressor.finish()?;
+                let data_size = std::fs::metadata(data_tmp.path())?.len();
+
+                parts.push(StreamingPartResult {
+                    data_tmp,
+                    data_size,
+                    files: std::mem::take(&mut current_files),
+                    total_size: current_size,
+                });
+                prog.part_completed(parts.len() as u32, data_size);
+                current_size = 0;
+                bytes_since_flush = 0;
+
+                // Start next part.
+                data_tmp = tempfile::NamedTempFile::new()?;
+                compressor = compress_writer(&compressor_config, &data_tmp)?;
+                tar = TarBuilder::new(compressor);
+
+                // Write directory entries to new part's tar.
+                for dir in &dir_entries {
+                    write_tar_entry(&mut tar, dir, mtime)?;
+                }
+            }
+        }
+    }
+
+    // Finalize last part (always has content unless file list was empty).
+    if !current_files.is_empty() {
+        compressor = tar
+            .into_inner()
+            .map_err(|e| DebError::Tar(e.to_string()))?;
+        compressor.finish()?;
+        let data_size = std::fs::metadata(data_tmp.path())?.len();
+
+        parts.push(StreamingPartResult {
+            data_tmp,
+            data_size,
+            files: std::mem::take(&mut current_files),
+            total_size: current_size,
+        });
+    }
+
+    prog.stage_finish(BuildStage::WritingPayload);
+
+    // Assemble each part into a .deb file.
+    let pkg_name = &plan.name;
+    let mut output_paths = Vec::new();
+
+    if parts.len() == 1 {
+        // Single part — no split actually needed.
+        let part = parts.pop().unwrap();
+        let filename =
+            PackageFileName::deb(pkg_name, &plan.version, &plan.release, &plan.arch);
+        let output_path = output_dir.join(&filename);
+
+        let sub_pkg = SubPackage {
+            name: pkg_name.clone(),
+            role: SubPackageRole::Standalone,
+            files: part.files,
+            total_size: part.total_size,
+            scripts: scripts.clone(),
+        };
+
+        assemble_deb_from_data_tar(
+            &sub_pkg,
+            plan,
+            config,
+            &output_path,
+            &[],
+            part.data_tmp,
+            part.data_size,
+            &compressor_config,
+            &compress_ext,
+            mtime,
+            prog,
+        )?;
+        output_paths.push(output_path);
+    } else {
+        // Multiple parts — build each part .deb + a meta-package.
+        let part_names: Vec<String> = (1..=parts.len())
+            .map(|n| format!("{pkg_name}-part{n}"))
+            .collect();
+
+        // Meta-package first.
+        let meta_filename =
+            PackageFileName::deb(pkg_name, &plan.version, &plan.release, &plan.arch);
+        let meta_path = output_dir.join(&meta_filename);
+        let extra_depends: Vec<String> = part_names
+            .iter()
+            .map(|n| format!("{n} (= {}-{})", plan.version, plan.release))
+            .collect();
+        let meta_sub = SubPackage {
+            name: pkg_name.clone(),
+            role: SubPackageRole::Meta,
+            files: Vec::new(),
+            total_size: 0,
+            scripts: scripts.clone(),
+        };
+        build_single_deb(&meta_sub, plan, config, &meta_path, &extra_depends, Some(prog))?;
+        output_paths.push(meta_path);
+
+        // Part packages.
+        for (i, part) in parts.into_iter().enumerate() {
+            let part_num = (i + 1) as u32;
+            let part_name = &part_names[i];
+            let filename =
+                PackageFileName::deb(part_name, &plan.version, &plan.release, &plan.arch);
+            let output_path = output_dir.join(&filename);
+
+            let sub_pkg = SubPackage {
+                name: part_name.clone(),
+                role: SubPackageRole::Part(part_num),
+                files: part.files,
+                total_size: part.total_size,
+                scripts: ResolvedScripts::default(),
+            };
+
+            assemble_deb_from_data_tar(
+                &sub_pkg,
+                plan,
+                config,
+                &output_path,
+                &[],
+                part.data_tmp,
+                part.data_size,
+                &compressor_config,
+                &compress_ext,
+                mtime,
+                prog,
+            )?;
+            output_paths.push(output_path);
+        }
+    }
+
+    Ok(output_paths)
+}
+
+/// Assemble a .deb from an already-written compressed data.tar temp file.
+///
+/// Builds the control.tar, then assembles the final ar archive using the
+/// pre-built data.tar. This avoids re-compressing data during streaming split.
+fn assemble_deb_from_data_tar(
+    sub_package: &SubPackage,
+    plan: &PackagePlan,
+    config: &Config,
+    output_path: &Path,
+    extra_depends: &[String],
+    data_tmp: tempfile::NamedTempFile,
+    data_size: u64,
+    compressor_config: &CompressorConfig,
+    compress_ext: &str,
+    mtime: u64,
+    progress: &dyn BuildProgress,
+) -> Result<(), DebError> {
+    // Build control.tar.
+    progress.stage_start(BuildStage::WritingControl, 0, 0);
+    let (control_tmp, control_size) = write_control_tar(
+        sub_package,
+        plan,
+        config,
+        extra_depends,
+        compressor_config,
+        mtime,
+    )?;
+    progress.stage_finish(BuildStage::WritingControl);
+
+    // Assemble ar archive.
+    progress.stage_start(BuildStage::Assembling, 0, 0);
+    let output_file = File::create(output_path).map_err(|e| DebError::SourceFile {
+        path: output_path.to_owned(),
+        source: e,
+    })?;
+    let mut ar = ArWriter::new(output_file);
+
+    ar.write_member("debian-binary", b"2.0\n", mtime, 0o100644)?;
+
+    let control_name = format!("control.tar{compress_ext}");
+    ar.begin_member(&control_name, control_size, mtime, 0o100644)?;
+    let mut control_file = File::open(control_tmp.path())?;
+    io::copy(&mut control_file, ar.writer_mut())?;
+    ar.finish_member()?;
+
     let data_name = format!("data.tar{compress_ext}");
     ar.begin_member(&data_name, data_size, mtime, 0o100644)?;
     let mut data_file = File::open(data_tmp.path())?;
@@ -398,6 +734,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: 0,
             warnings: Vec::new(),
+            deferred_split: false,
         }
     }
 
@@ -1042,5 +1379,289 @@ mod tests {
             // Uncompressed or unknown — return as-is.
             data.to_vec()
         }
+    }
+
+    // --- Streaming split tests ---
+
+    /// Build a deferred-split plan for testing with a custom threshold.
+    /// Uses uncompressed algorithm so compressed size ≈ uncompressed size,
+    /// making threshold behavior predictable.
+    fn streaming_split_plan(files: Vec<FileEntry>, total_size: u64) -> PackagePlan {
+        PackagePlan {
+            name: "testpkg".to_string(),
+            version: "1.0".to_string(),
+            release: "1".to_string(),
+            arch: "x86_64".to_string(),
+            sub_packages: vec![SubPackage {
+                name: "testpkg".to_string(),
+                role: SubPackageRole::Standalone,
+                files,
+                total_size,
+                scripts: ResolvedScripts::default(),
+            }],
+            is_split: false,
+            needs_extended_cpio: false,
+            total_size,
+            warnings: Vec::new(),
+            deferred_split: true,
+        }
+    }
+
+    fn uncompressed_config() -> Config {
+        let mut config = test_config();
+        config.compression.algorithm = "none".to_string();
+        config
+    }
+
+    #[test]
+    fn test_streaming_split_single_part() {
+        // Small files that don't exceed any threshold — should produce 1 standalone .deb.
+        let dir = tempfile::tempdir().unwrap();
+        let src = create_temp_file(dir.path(), "hello.txt", b"hello world\n");
+        let output_dir = dir.path().join("out");
+
+        let files = vec![
+            FileEntry {
+                install_path: PathBuf::from("/opt"),
+                source_path: PathBuf::new(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/hello.txt"),
+                source_path: src,
+                entry_type: EntryType::RegularFile,
+                size: 12,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        let config = uncompressed_config();
+        let plan = streaming_split_plan(files, 12);
+
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
+        assert_eq!(paths.len(), 1, "single small file should not split");
+
+        let filename = paths[0].file_name().unwrap().to_str().unwrap();
+        // DEB arch mapping: x86_64 → amd64 via PackageFileName::deb()
+        assert_eq!(filename, "testpkg_1.0-1_amd64.deb");
+
+        // Verify it's a valid ar archive.
+        let data = std::fs::read(&paths[0]).unwrap();
+        assert_eq!(&data[..8], b"!<arch>\n");
+    }
+
+    #[test]
+    fn test_streaming_split_deferred_flag_routes_correctly() {
+        // Verify that deferred_split=true routes through build_streaming_split.
+        let dir = tempfile::tempdir().unwrap();
+        let src = create_temp_file(dir.path(), "f", b"x");
+        let output_dir = dir.path().join("out");
+
+        let files = vec![FileEntry {
+            install_path: PathBuf::from("/opt/f"),
+            source_path: src,
+            entry_type: EntryType::RegularFile,
+            size: 1,
+            mode: 0o644,
+            user: "root".to_string(),
+            group: "root".to_string(),
+            is_config: false,
+        }];
+
+        let config = uncompressed_config();
+        let plan = streaming_split_plan(files, 1);
+
+        // This should succeed via build_streaming_split path.
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_streaming_split_with_hardlinks() {
+        // Verify hardlinks stay in the same part as their target.
+        let dir = tempfile::tempdir().unwrap();
+        let src_a = create_temp_file(dir.path(), "file_a", b"shared content here");
+        let src_b = dir.path().join("file_b");
+        std::fs::hard_link(&src_a, &src_b).unwrap();
+
+        let output_dir = dir.path().join("out");
+
+        let files = vec![
+            FileEntry {
+                install_path: PathBuf::from("/opt"),
+                source_path: PathBuf::new(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/file_a"),
+                source_path: src_a,
+                entry_type: EntryType::RegularFile,
+                size: 19,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/file_b"),
+                source_path: src_b,
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/opt/file_a"),
+                },
+                size: 0,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        let config = uncompressed_config();
+        let plan = streaming_split_plan(files, 19);
+
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
+        assert_eq!(paths.len(), 1);
+
+        // Extract the data tar and verify both files are present.
+        let deb_data = std::fs::read(&paths[0]).unwrap();
+        let data_tar = extract_data_tar_from_deb(&deb_data);
+        let mut archive = tar::Archive::new(&data_tar[..]);
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let paths_in_tar: Vec<String> = entries
+            .iter()
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            paths_in_tar.iter().any(|p| p.contains("file_a")),
+            "file_a should be in tar: {paths_in_tar:?}"
+        );
+        assert!(
+            paths_in_tar.iter().any(|p| p.contains("file_b")),
+            "file_b should be in tar: {paths_in_tar:?}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_split_directories_in_each_part() {
+        // Even if we had multiple parts, each should contain directory entries.
+        // This test verifies directory entries are written to the tar.
+        let dir = tempfile::tempdir().unwrap();
+        let src = create_temp_file(dir.path(), "f", b"data");
+        let output_dir = dir.path().join("out");
+
+        let files = vec![
+            FileEntry {
+                install_path: PathBuf::from("/opt"),
+                source_path: PathBuf::new(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/app"),
+                source_path: PathBuf::new(),
+                entry_type: EntryType::Directory,
+                size: 0,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/app/f"),
+                source_path: src,
+                entry_type: EntryType::RegularFile,
+                size: 4,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        let config = uncompressed_config();
+        let plan = streaming_split_plan(files, 4);
+
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
+        assert_eq!(paths.len(), 1);
+
+        let deb_data = std::fs::read(&paths[0]).unwrap();
+        let data_tar = extract_data_tar_from_deb(&deb_data);
+        let mut archive = tar::Archive::new(&data_tar[..]);
+        let entry_types: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.path().unwrap().to_string_lossy().to_string(),
+                    e.header().entry_type(),
+                )
+            })
+            .collect();
+
+        let dir_count = entry_types
+            .iter()
+            .filter(|(_, t)| *t == TarEntryType::Directory)
+            .count();
+        assert!(
+            dir_count >= 2,
+            "should have at least 2 directory entries, got {dir_count}: {entry_types:?}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_split_control_file_correct() {
+        // Verify the control file in a deferred-split .deb has correct metadata.
+        let dir = tempfile::tempdir().unwrap();
+        let src = create_temp_file(dir.path(), "f", b"data");
+        let output_dir = dir.path().join("out");
+
+        let files = vec![FileEntry {
+            install_path: PathBuf::from("/opt/f"),
+            source_path: src,
+            entry_type: EntryType::RegularFile,
+            size: 4,
+            mode: 0o644,
+            user: "root".to_string(),
+            group: "root".to_string(),
+            is_config: false,
+        }];
+
+        let config = uncompressed_config();
+        let plan = streaming_split_plan(files, 4);
+
+        let paths = DebBuilder::build(&plan, &config, &output_dir, None).unwrap();
+        let deb_data = std::fs::read(&paths[0]).unwrap();
+        let control_text = extract_control_from_deb(&deb_data);
+        assert!(
+            control_text.contains("Package: testpkg"),
+            "control should have package name: {control_text}"
+        );
+        assert!(
+            control_text.contains("Version: 1.0-1"),
+            "control should have version: {control_text}"
+        );
     }
 }

@@ -350,6 +350,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: files.iter().map(|f| f.size).sum(),
             warnings: vec![],
+            deferred_split: false,
         };
         let sub_pkg = SubPackage {
             name: config.package.name.clone(),

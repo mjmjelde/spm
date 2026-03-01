@@ -247,6 +247,7 @@ mod tests {
             needs_extended_cpio: false,
             total_size: 4096,
             warnings: Vec::new(),
+            deferred_split: false,
         }
     }
 

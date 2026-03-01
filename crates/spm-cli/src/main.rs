@@ -344,7 +344,12 @@ fn cmd_plan(
         }
 
         // Splitting info.
-        if plan.is_split {
+        if plan.deferred_split {
+            println!(
+                "  Splitting: AUTO (actual split point determined at build time \
+                 based on compressed size)"
+            );
+        } else if plan.is_split {
             println!("  Splitting: REQUIRED");
             println!("  Split plan:");
             for sp in &plan.sub_packages {
@@ -526,71 +531,150 @@ fn cmd_build(
                 }
             }
             "deb" => {
-                for (i, sub_pkg) in plan.sub_packages.iter().enumerate() {
-                    let filename = PackageFileName::deb(
-                        &sub_pkg.name,
-                        &plan.version,
-                        &plan.release,
-                        &plan.arch,
+                if plan.deferred_split {
+                    // Streaming split: builder monitors actual compressed
+                    // sizes and partitions automatically.
+                    let label = format!(
+                        "{} (auto-split)",
+                        PackageFileName::deb(
+                            &plan.name,
+                            &plan.version,
+                            &plan.release,
+                            &plan.arch,
+                        ),
                     );
-                    let output_path = output_dir.join(&filename);
-
                     let progress = if quiet {
                         None
                     } else {
-                        Some(IndicatifProgress::new(&multi, &filename))
+                        Some(IndicatifProgress::new(&multi, &label))
                     };
 
                     let pkg_start = Instant::now();
 
-                    // For meta-packages, compute Depends on all parts.
-                    let extra_depends: Vec<String> =
-                        if sub_pkg.role == SubPackageRole::Meta {
-                            plan.sub_packages
-                                .iter()
-                                .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
-                                .map(|sp| {
-                                    format!(
-                                        "{} (= {}-{})",
-                                        sp.name, plan.version, plan.release
-                                    )
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                    spm_deb::builder::build_single_deb(
-                        sub_pkg,
+                    let paths = spm_deb::builder::DebBuilder::build(
                         &plan,
                         &config,
-                        &output_path,
-                        &extra_depends,
+                        output_dir,
                         progress.as_ref().map(|p| p as &dyn BuildProgress),
                     )
-                    .with_context(|| {
-                        format!(
-                            "failed to build DEB '{filename}' (sub-package {} of {total_sub})",
-                            i + 1
-                        )
-                    })?;
+                    .context("failed to build DEB with streaming split")?;
 
                     let elapsed = pkg_start.elapsed();
-                    let output_size = std::fs::metadata(&output_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-
                     if let Some(ref p) = progress {
-                        p.finish(output_size, elapsed);
+                        let total_output: u64 = paths
+                            .iter()
+                            .filter_map(|p| std::fs::metadata(p).ok())
+                            .map(|m| m.len())
+                            .sum();
+                        p.finish(total_output, elapsed);
                     }
 
+                    let total_files = count_files(&plan.sub_packages[0].files);
+                    let total_compressed: u64 = paths
+                        .iter()
+                        .filter_map(|p| std::fs::metadata(p).ok())
+                        .map(|m| m.len())
+                        .sum();
+
+                    let summary_name = if paths.len() > 1 {
+                        // Multiple files: meta-package + N parts.
+                        let part_count = paths.len() - 1;
+                        format!(
+                            "{} ({part_count} parts)",
+                            PackageFileName::deb(
+                                &plan.name,
+                                &plan.version,
+                                &plan.release,
+                                &plan.arch,
+                            ),
+                        )
+                    } else {
+                        paths[0]
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string()
+                    };
+
                     build_results.push(BuildResult {
-                        filename,
-                        file_count: count_files(&sub_pkg.files),
-                        uncompressed_size: sub_pkg.total_size,
-                        compressed_size: output_size,
+                        filename: summary_name,
+                        file_count: total_files,
+                        uncompressed_size: plan.total_size,
+                        compressed_size: total_compressed,
                         duration: elapsed,
                     });
+                } else {
+                    for (i, sub_pkg) in plan.sub_packages.iter().enumerate() {
+                        let filename = PackageFileName::deb(
+                            &sub_pkg.name,
+                            &plan.version,
+                            &plan.release,
+                            &plan.arch,
+                        );
+                        let output_path = output_dir.join(&filename);
+
+                        let progress = if quiet {
+                            None
+                        } else {
+                            Some(IndicatifProgress::new(&multi, &filename))
+                        };
+
+                        let pkg_start = Instant::now();
+
+                        // For meta-packages, compute Depends on all parts.
+                        let extra_depends: Vec<String> =
+                            if sub_pkg.role == SubPackageRole::Meta {
+                                plan.sub_packages
+                                    .iter()
+                                    .filter(|sp| {
+                                        matches!(sp.role, SubPackageRole::Part(_))
+                                    })
+                                    .map(|sp| {
+                                        format!(
+                                            "{} (= {}-{})",
+                                            sp.name, plan.version, plan.release
+                                        )
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                        spm_deb::builder::build_single_deb(
+                            sub_pkg,
+                            &plan,
+                            &config,
+                            &output_path,
+                            &extra_depends,
+                            progress
+                                .as_ref()
+                                .map(|p| p as &dyn BuildProgress),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to build DEB '{filename}' \
+                                 (sub-package {} of {total_sub})",
+                                i + 1
+                            )
+                        })?;
+
+                        let elapsed = pkg_start.elapsed();
+                        let output_size = std::fs::metadata(&output_path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+
+                        if let Some(ref p) = progress {
+                            p.finish(output_size, elapsed);
+                        }
+
+                        build_results.push(BuildResult {
+                            filename,
+                            file_count: count_files(&sub_pkg.files),
+                            uncompressed_size: sub_pkg.total_size,
+                            compressed_size: output_size,
+                            duration: elapsed,
+                        });
+                    }
                 }
             }
             _ => unreachable!(),
@@ -748,6 +832,12 @@ impl BuildProgress for IndicatifProgress {
             self.multi.remove(&bar);
         }
         *self.stage_start_time.borrow_mut() = None;
+    }
+
+    fn part_completed(&self, part: u32, compressed_size: u64) {
+        self.multi
+            .println(format!("  Part {part}: {}", format_size(compressed_size)))
+            .ok();
     }
 }
 

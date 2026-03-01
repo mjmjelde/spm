@@ -45,6 +45,10 @@ pub struct PackagePlan {
     pub total_size: u64,
     /// Non-fatal warnings generated during planning.
     pub warnings: Vec<String>,
+    /// When true, the DEB builder should perform monitored streaming split
+    /// instead of relying on pre-computed SubPackage boundaries. The plan
+    /// will contain a single SubPackage with all files.
+    pub deferred_split: bool,
 }
 
 /// A single buildable package (standalone, meta-package, or part of a split).
@@ -105,6 +109,8 @@ impl Planner {
         let estimated_compressed = (total_size as f64 * ratio) as u64;
         let split_threshold = (limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM) as u64;
 
+        let mut deferred_split = false;
+
         let sub_packages = if !config.splitting.enabled {
             // Splitting disabled — check if we're within limits (with safety margin).
             if estimated_compressed > split_threshold {
@@ -132,9 +138,19 @@ impl Planner {
                             total_size,
                             scripts,
                         }]
+                    } else if limits.max_compressed_payload < u64::MAX {
+                        // Format has a finite payload limit (DEB): defer splitting
+                        // to the builder which monitors actual compressed size.
+                        deferred_split = true;
+                        vec![SubPackage {
+                            name: pkg_name.clone(),
+                            role: SubPackageRole::Standalone,
+                            files,
+                            total_size,
+                            scripts,
+                        }]
                     } else {
-                        // Split needed. Calculate number of even parts, then
-                        // divide total uncompressed size equally.
+                        // Unlimited format (RPM): use estimation-based split.
                         let safe_limit =
                             limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
                         let num_parts =
@@ -218,6 +234,7 @@ impl Planner {
             needs_extended_cpio,
             total_size,
             warnings,
+            deferred_split,
         })
     }
 
@@ -238,6 +255,8 @@ impl Planner {
         let ratio = estimated_compression_ratio(&config.compression.algorithm);
         let estimated_compressed = (total_size as f64 * ratio) as u64;
         let split_threshold = (limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM) as u64;
+
+        let mut deferred_split = false;
 
         let sub_packages = if !config.splitting.enabled {
             if estimated_compressed > split_threshold {
@@ -264,7 +283,19 @@ impl Planner {
                             total_size,
                             scripts,
                         }]
+                    } else if limits.max_compressed_payload < u64::MAX {
+                        // Format has a finite payload limit (DEB): defer splitting
+                        // to the builder which monitors actual compressed size.
+                        deferred_split = true;
+                        vec![SubPackage {
+                            name: pkg_name.clone(),
+                            role: SubPackageRole::Standalone,
+                            files,
+                            total_size,
+                            scripts,
+                        }]
                     } else {
+                        // Unlimited format (RPM): use estimation-based split.
                         let safe_limit =
                             limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
                         let num_parts =
@@ -344,6 +375,7 @@ impl Planner {
             needs_extended_cpio,
             total_size,
             warnings,
+            deferred_split,
         })
     }
 }
@@ -540,6 +572,58 @@ fn split_by_directory(
     parts
 }
 
+/// Pre-scanned hardlink family map for streaming split.
+///
+/// Maps each hardlink target to the indices of its link entries in the file list.
+/// Used by the DEB streaming split builder to keep hardlink families together
+/// in the same package part.
+pub struct HardlinkFamilies {
+    /// hardlink-target install_path → indices of link entries pointing to it.
+    target_to_links: std::collections::HashMap<std::path::PathBuf, Vec<usize>>,
+    /// Set of indices that are hardlink entries (to skip in the main loop).
+    link_indices: std::collections::HashSet<usize>,
+}
+
+impl HardlinkFamilies {
+    /// Pre-scan a file list and build the family map.
+    pub fn scan(files: &[FileEntry]) -> Self {
+        let mut target_to_links: std::collections::HashMap<std::path::PathBuf, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut link_indices = std::collections::HashSet::new();
+
+        for (i, entry) in files.iter().enumerate() {
+            if let EntryType::Hardlink { ref target } = entry.entry_type {
+                target_to_links
+                    .entry(target.clone())
+                    .or_default()
+                    .push(i);
+                link_indices.insert(i);
+            }
+        }
+
+        Self {
+            target_to_links,
+            link_indices,
+        }
+    }
+
+    /// Returns true if this index is a hardlink entry that should be skipped
+    /// in the main iteration (it will be pulled in when its target is processed).
+    pub fn is_link(&self, index: usize) -> bool {
+        self.link_indices.contains(&index)
+    }
+
+    /// If this file is a hardlink target, return the indices of all its link entries.
+    pub fn links_for_target(&self, target_path: &std::path::Path) -> Option<&[usize]> {
+        self.target_to_links.get(target_path).map(|v| v.as_slice())
+    }
+
+    /// Returns true if there are no hardlinks in the file list.
+    pub fn is_empty(&self) -> bool {
+        self.target_to_links.is_empty()
+    }
+}
+
 /// When files are split across parts, hardlinks whose target is in a different
 /// part must be converted to regular files with their actual size restored.
 ///
@@ -727,20 +811,11 @@ mod tests {
         let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
             .unwrap();
 
-        assert!(plan.is_split);
-        // 30 GiB × 0.35 = 10.5 GiB estimated. Threshold = 9.999G × 0.80 = ~8.0 GiB.
-        // num_parts = ceil(10.5 / 8.0) = 2. So: 1 meta + 2 parts = 3.
-        assert_eq!(plan.sub_packages.len(), 3); // Meta + 2 parts
-
-        // First sub-package should be the meta-package.
-        assert_eq!(plan.sub_packages[0].role, SubPackageRole::Meta);
-        assert!(plan.sub_packages[0].files.is_empty());
-
-        // Remaining should be parts.
-        for (i, sp) in plan.sub_packages.iter().skip(1).enumerate() {
-            assert_eq!(sp.role, SubPackageRole::Part((i + 1) as u32));
-            assert!(!sp.files.is_empty());
-        }
+        // DEB auto-split now defers to the builder for monitored streaming split.
+        assert!(plan.deferred_split, "DEB over-limit should set deferred_split");
+        assert_eq!(plan.sub_packages.len(), 1, "deferred split produces single SubPackage");
+        assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
+        assert!(!plan.sub_packages[0].files.is_empty());
     }
 
     #[test]
@@ -948,7 +1023,7 @@ mod tests {
     fn test_auto_split_deb_borderline() {
         // 25 GiB uncompressed × 0.35 = 8.75 GiB estimated.
         // Raw DEB limit is 9.999 GiB, but with 0.80 headroom the threshold is ~8.0 GiB.
-        // 8.75 GiB > 8.0 GiB → should trigger splitting.
+        // 8.75 GiB > 8.0 GiB → should trigger deferred split.
         let config = test_config("borderline", "auto");
         let limits = FormatLimits::deb();
 
@@ -964,13 +1039,10 @@ mod tests {
         let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
             .unwrap();
 
-        assert!(plan.is_split, "expected splitting for borderline package");
-        // Should have a warning about safety margin since estimated < raw limit.
-        assert!(
-            plan.warnings.iter().any(|w| w.contains("safety margin")),
-            "expected safety margin warning, got: {:?}",
-            plan.warnings
-        );
+        // DEB borderline now defers to the builder.
+        assert!(plan.deferred_split, "expected deferred_split for borderline DEB");
+        assert_eq!(plan.sub_packages.len(), 1);
+        assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
     }
 
     #[test]
@@ -1497,16 +1569,13 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_split_no_trailing_runt_part() {
-        // Reproduce the Matlab bug: total size causes num_parts=2 but
-        // greedy packing leaves a tiny file in a would-be part 3.
+    fn test_auto_split_deb_defers_instead_of_splitting() {
+        // Previously this tested the trailing runt merge for DEB.
+        // Now DEB auto-split defers to the builder, so verify deferred_split is set
+        // and all files are in a single SubPackage.
         let config = test_config("matlab", "auto");
         let limits = FormatLimits::deb();
 
-        // DEB safe_limit ≈ 8 GiB. With ZSTD ratio 0.35:
-        //   total = 24 GiB + 495 B → est_compressed ≈ 8.4 GiB → num_parts = 2
-        //   per_part = (24 GiB + 495) / 2 ≈ 12 GiB
-        // 8 chunks of 3 GiB fill 2 parts evenly, leaving the 495-byte file.
         let gib = 1024 * 1024 * 1024u64;
         let chunk = 3 * gib;
         let files = vec![
@@ -1531,27 +1600,114 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.is_split);
+        assert!(plan.deferred_split, "DEB auto-split should defer to builder");
+        assert_eq!(plan.sub_packages.len(), 1);
+        assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
 
-        let data_parts: Vec<_> = plan
-            .sub_packages
+        // All files should be present in the single SubPackage.
+        let has_tiny = plan.sub_packages[0]
+            .files
             .iter()
-            .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
-            .collect();
+            .any(|f| f.install_path.ends_with("tiny_leftover.txt"));
+        assert!(has_tiny, "tiny file must not be lost");
+    }
 
-        assert_eq!(
-            data_parts.len(),
-            2,
-            "expected 2 data parts (no trailing runt), got {}",
-            data_parts.len()
-        );
+    // --- HardlinkFamilies tests ---
 
-        // The tiny file must not be lost.
-        let has_tiny = data_parts.iter().any(|sp| {
-            sp.files
-                .iter()
-                .any(|f| f.install_path.ends_with("tiny_leftover.txt"))
-        });
-        assert!(has_tiny, "tiny file must not be lost during merge");
+    #[test]
+    fn test_hardlink_families_no_links() {
+        let files = vec![test_file("/opt/a", 100), test_file("/opt/b", 200)];
+        let families = HardlinkFamilies::scan(&files);
+        assert!(families.is_empty());
+        assert!(!families.is_link(0));
+        assert!(!families.is_link(1));
+        assert!(families.links_for_target(Path::new("/opt/a")).is_none());
+    }
+
+    #[test]
+    fn test_hardlink_families_basic() {
+        let files = vec![
+            test_file("/opt/target", 100),
+            FileEntry {
+                install_path: PathBuf::from("/opt/link1"),
+                source_path: PathBuf::from("/src/target"),
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/opt/target"),
+                },
+                size: 0,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/opt/link2"),
+                source_path: PathBuf::from("/src/target"),
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/opt/target"),
+                },
+                size: 0,
+                mode: 0o644,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+        let families = HardlinkFamilies::scan(&files);
+        assert!(!families.is_empty());
+        assert!(!families.is_link(0)); // target is not a link
+        assert!(families.is_link(1)); // link1 is a link
+        assert!(families.is_link(2)); // link2 is a link
+
+        let links = families
+            .links_for_target(Path::new("/opt/target"))
+            .unwrap();
+        assert_eq!(links, &[1, 2]);
+    }
+
+    // --- Deferred split tests ---
+
+    #[test]
+    fn test_deferred_split_for_deb_auto() {
+        use crate::types::FormatLimits;
+
+        // Create a config with auto-split enabled and large enough data to trigger it.
+        let mut config = test_config("bigpkg", "auto");
+        config.splitting.enabled = true;
+
+        let limits = FormatLimits::deb();
+
+        // Create files whose estimated compressed size exceeds the DEB limit.
+        // DEB limit = 9_999_999_999, zstd ratio = 0.35, headroom = 0.80.
+        // Threshold = 9_999_999_999 * 0.80 = 7_999_999_999.
+        // Need estimated > threshold: total * 0.35 > 7_999_999_999
+        // total > 22_857_142_854
+        let files = vec![test_file("/opt/bigfile", 25_000_000_000)];
+        let scripts = ResolvedScripts::default();
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, scripts).unwrap();
+        assert!(plan.deferred_split, "DEB auto-split should set deferred_split");
+        assert_eq!(plan.sub_packages.len(), 1, "should produce single SubPackage");
+        assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
+        assert!(!plan.is_split, "is_split should be false (no Meta subpackage)");
+    }
+
+    #[test]
+    fn test_no_deferred_split_for_rpm_auto() {
+        use crate::types::FormatLimits;
+
+        let mut config = test_config("bigpkg", "auto");
+        config.splitting.enabled = true;
+
+        let limits = FormatLimits::rpm();
+
+        // RPM has u64::MAX limit, so even with huge files estimation-based split is used.
+        // But RPM auto-split threshold is u64::MAX * 0.80 which is still enormous.
+        // With RPM, auto-split should never trigger deferred_split.
+        let files = vec![test_file("/opt/bigfile", 100)];
+        let scripts = ResolvedScripts::default();
+
+        let plan = Planner::plan_from_entries(&config, &limits, files, scripts).unwrap();
+        assert!(!plan.deferred_split, "RPM should not set deferred_split");
     }
 }
