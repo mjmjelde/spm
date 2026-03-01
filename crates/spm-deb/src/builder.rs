@@ -154,8 +154,8 @@ fn write_data_tar(
 
         // Finalize the tar (writes two 512-byte zero blocks).
         let compressor = tar.into_inner().map_err(|e| DebError::Tar(e.to_string()))?;
-        // Drop compressor to flush compression.
-        drop(compressor);
+        // Explicitly finalize the compression stream, propagating any errors.
+        compressor.finish()?;
     }
 
     let size = std::fs::metadata(tmp.path())?.len();
@@ -206,7 +206,8 @@ fn write_control_tar(
         }
 
         let compressor = tar.into_inner().map_err(|e| DebError::Tar(e.to_string()))?;
-        drop(compressor);
+        // Explicitly finalize the compression stream, propagating any errors.
+        compressor.finish()?;
     }
 
     let size = std::fs::metadata(tmp.path())?.len();

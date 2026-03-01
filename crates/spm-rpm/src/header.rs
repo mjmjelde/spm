@@ -244,6 +244,13 @@ impl HeaderBuilder {
             let pad = (align - (data.len() % align)) % align;
             data.extend(std::iter::repeat_n(0u8, pad));
 
+            if data.len() > i32::MAX as usize {
+                return Err(RpmError::InvalidRpm(format!(
+                    "header data section too large ({} bytes, max {})",
+                    data.len(),
+                    i32::MAX
+                )));
+            }
             let offset = data.len() as i32;
             let count = value.count();
             let tag_type = value.tag_type();

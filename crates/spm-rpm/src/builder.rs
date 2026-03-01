@@ -73,12 +73,17 @@ impl RpmBuilder {
         prog.stage_start(BuildStage::WritingPayload, file_count, total_bytes);
         let payload_tmp = tempfile::NamedTempFile::new()?;
         let uncompressed_size: u64;
+        let inode_map = build_inode_map(&sub_package.files);
         {
             let compressor = compress_writer(&compressor_config, &payload_tmp)?;
             let mut cpio = CpioWriter::new(compressor, cpio_format);
 
             for (index, entry) in sub_package.files.iter().enumerate() {
-                let metadata = file_entry_to_cpio_metadata(entry);
+                let metadata = file_entry_to_cpio_metadata(
+                    entry,
+                    inode_map.inodes[index],
+                    inode_map.nlinks[index],
+                );
                 let cpio_name = make_cpio_name(&entry.install_path, cpio_format);
 
                 write_cpio_entry(&mut cpio, index as u32, &cpio_name, &metadata, entry)?;
@@ -87,8 +92,8 @@ impl RpmBuilder {
 
             let (compressor, bytes) = cpio.finish()?;
             uncompressed_size = bytes;
-            // Drop the compressor to flush (auto_finish for zstd).
-            drop(compressor);
+            // Explicitly finalize the compression stream, propagating any errors.
+            compressor.finish()?;
         }
         prog.stage_finish(BuildStage::WritingPayload);
 
@@ -101,6 +106,7 @@ impl RpmBuilder {
             &file_digests,
             &algorithm,
             target_distro,
+            &inode_map,
         )?;
         prog.stage_finish(BuildStage::BuildingMetadata);
 
@@ -150,6 +156,7 @@ fn build_metadata_header(
     file_digests: &[String],
     algorithm: &Algorithm,
     target_distro: Option<&Distro>,
+    inode_map: &InodeMap,
 ) -> Result<Vec<u8>, RpmError> {
     let mut hdr = HeaderBuilder::new();
 
@@ -161,10 +168,19 @@ fn build_metadata_header(
             &sub_package.files,
             plan.needs_extended_cpio,
             file_digests,
+            inode_map,
         )?;
     }
 
-    add_dependencies(&mut hdr, config, algorithm, target_distro)?;
+    add_dependencies(
+        &mut hdr,
+        config,
+        algorithm,
+        target_distro,
+        &sub_package.name,
+        &plan.version,
+        &plan.release,
+    )?;
     add_scripts(&mut hdr, &sub_package.scripts)?;
 
     // Region tag (must be added last — its data goes at end of data section).
@@ -187,18 +203,19 @@ fn add_package_metadata(
     hdr.add_i18n_string(RPMTAG_SUMMARY, &config.package.description);
     hdr.add_i18n_string(RPMTAG_DESCRIPTION, &config.package.description);
 
-    // Build time.
+    // Build time (RPM uses INT32, so clamp to i32::MAX to avoid 2038 wrap).
     let build_time = config
         .build
         .as_ref()
         .and_then(|b| b.source_date_epoch.as_ref())
-        .and_then(|s| s.parse::<i32>().ok())
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs() as i32
+                .as_secs()
         });
+    let build_time = clamp_timestamp(build_time);
     hdr.add_int32(RPMTAG_BUILDTIME, vec![build_time]);
 
     // Build host.
@@ -235,7 +252,7 @@ fn add_package_metadata(
 
     hdr.add_string(RPMTAG_OS, "linux");
     hdr.add_string(RPMTAG_ARCH, &plan.arch);
-    hdr.add_string(RPMTAG_SOURCERPM, "");
+    hdr.add_string(RPMTAG_SOURCERPM, "(none)");
     hdr.add_string(RPMTAG_RPMVERSION, "spm");
     hdr.add_string(RPMTAG_OPTFLAGS, "");
     hdr.add_string(RPMTAG_PAYLOADFORMAT, "cpio");
@@ -258,6 +275,7 @@ fn add_file_metadata(
     files: &[FileEntry],
     needs_extended: bool,
     file_digests: &[String],
+    inode_map: &InodeMap,
 ) -> Result<(), RpmError> {
     let (basenames, dirnames, dirindexes) = decompose_paths(files);
 
@@ -285,7 +303,7 @@ fn add_file_metadata(
     let rdevs: Vec<i16> = vec![0i16; files.len()];
     hdr.add_int16(RPMTAG_FILERDEVS, rdevs);
 
-    // File modification times.
+    // File modification times (clamped to i32::MAX to avoid 2038 wrap).
     let mtimes: Vec<i32> = files
         .iter()
         .map(|f| {
@@ -293,7 +311,7 @@ fn add_file_metadata(
                 meta.modified()
                     .ok()
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i32)
+                    .map(|d| clamp_timestamp(d.as_secs()))
                     .unwrap_or(0)
             } else {
                 0
@@ -308,14 +326,26 @@ fn add_file_metadata(
     // Digest algorithm: SHA-256.
     hdr.add_int32(RPMTAG_FILEDIGESTALGO, vec![PGPHASHALGO_SHA256 as i32]);
 
-    // Symlink targets (empty string for non-symlinks).
-    let linktos: Vec<String> = files
-        .iter()
-        .map(|f| match &f.entry_type {
-            EntryType::Symlink { target } => target.to_string_lossy().into_owned(),
-            _ => String::new(),
-        })
-        .collect();
+    // Symlink targets (empty string for non-symlinks; error on non-UTF-8).
+    let mut linktos: Vec<String> = Vec::with_capacity(files.len());
+    for f in files {
+        match &f.entry_type {
+            EntryType::Symlink { target } => {
+                let s = target.to_str().ok_or_else(|| RpmError::SourceFile {
+                    path: f.install_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "symlink target contains non-UTF-8 bytes: {}",
+                            target.to_string_lossy()
+                        ),
+                    ),
+                })?;
+                linktos.push(s.to_string());
+            }
+            _ => linktos.push(String::new()),
+        }
+    }
     hdr.add_string_array(RPMTAG_FILELINKTOS, linktos);
 
     // File flags (config/noreplace).
@@ -341,8 +371,8 @@ fn add_file_metadata(
     let devices: Vec<i32> = vec![1; files.len()];
     hdr.add_int32(RPMTAG_FILEDEVICES, devices);
 
-    // File inodes (sequential, unique per entry).
-    let inodes: Vec<i32> = (1..=files.len() as i32).collect();
+    // File inodes (shared for hardlink groups, unique otherwise).
+    let inodes: Vec<i32> = inode_map.inodes.iter().map(|&ino| ino as i32).collect();
     hdr.add_int32(RPMTAG_FILEINODES, inodes);
 
     // File languages (empty string for all).
@@ -418,6 +448,9 @@ fn add_dependencies(
     config: &Config,
     algorithm: &Algorithm,
     target_distro: Option<&Distro>,
+    pkg_name: &str,
+    pkg_version: &str,
+    pkg_release: &str,
 ) -> Result<(), RpmError> {
     let mut names: Vec<String> = Vec::new();
     let mut versions: Vec<String> = Vec::new();
@@ -435,6 +468,12 @@ fn add_dependencies(
     if *algorithm == Algorithm::Zstd {
         names.push("rpmlib(PayloadIsZstd)".into());
         versions.push("5.4.18-1".into());
+        flags.push((RPMSENSE_RPMLIB | RPMSENSE_LESS | RPMSENSE_EQUAL) as i32);
+    }
+
+    if *algorithm == Algorithm::Xz {
+        names.push("rpmlib(PayloadIsXz)".into());
+        versions.push("5.2-1".into());
         flags.push((RPMSENSE_RPMLIB | RPMSENSE_LESS | RPMSENSE_EQUAL) as i32);
     }
 
@@ -472,12 +511,9 @@ fn add_dependencies(
         hdr.add_int32(RPMTAG_REQUIREFLAGS, flags);
     }
 
-    // Self-provides.
-    let provide_names = vec![config.package.name.clone()];
-    let provide_versions = vec![format!(
-        "{}-{}",
-        config.package.version, config.package.release
-    )];
+    // Self-provides (use actual sub-package name and plan version/release).
+    let provide_names = vec![pkg_name.to_string()];
+    let provide_versions = vec![format!("{pkg_version}-{pkg_release}")];
     let provide_flags = vec![RPMSENSE_EQUAL as i32];
     hdr.add_string_array(RPMTAG_PROVIDENAME, provide_names);
     hdr.add_string_array(RPMTAG_PROVIDEVERSION, provide_versions);
@@ -575,8 +611,88 @@ fn add_scripts(
     Ok(())
 }
 
+/// Hardlink inode mapping for CPIO and RPM metadata.
+///
+/// Maps each file entry index to its inode number and nlink count.
+/// Regular files get unique inodes with nlink=1. Hardlinked files sharing
+/// the same target get the same inode and a nlink equal to the group size.
+struct InodeMap {
+    /// inode number for each file entry (by index).
+    inodes: Vec<u32>,
+    /// nlink count for each file entry (by index).
+    nlinks: Vec<u32>,
+}
+
+/// Build the inode/nlink map for a set of file entries.
+///
+/// Hardlinked files sharing the same target path are assigned the same
+/// inode number and their nlink count reflects the group size.
+fn build_inode_map(files: &[FileEntry]) -> InodeMap {
+    let mut inodes = vec![0u32; files.len()];
+    let mut nlinks = vec![1u32; files.len()];
+
+    // Map hardlink target → list of file indices sharing that target.
+    let mut hardlink_groups: HashMap<&Path, Vec<usize>> = HashMap::new();
+    for (i, entry) in files.iter().enumerate() {
+        if let EntryType::Hardlink { target } = &entry.entry_type {
+            hardlink_groups
+                .entry(target.as_path())
+                .or_default()
+                .push(i);
+        }
+    }
+
+    // Also include the original file (non-hardlink) that a hardlink points to,
+    // if it appears in the file list with the same install_path as the target.
+    // Build a path-to-index map for regular files.
+    let mut path_to_idx: HashMap<&Path, usize> = HashMap::new();
+    for (i, entry) in files.iter().enumerate() {
+        if matches!(entry.entry_type, EntryType::RegularFile) {
+            path_to_idx.insert(entry.install_path.as_path(), i);
+        }
+    }
+
+    let mut next_ino: u32 = 1;
+
+    // Assign unique inodes to non-hardlink entries first.
+    for (i, entry) in files.iter().enumerate() {
+        if !matches!(entry.entry_type, EntryType::Hardlink { .. }) {
+            inodes[i] = next_ino;
+            next_ino += 1;
+        }
+    }
+
+    // Assign shared inodes to hardlink groups.
+    for (target, indices) in &hardlink_groups {
+        let shared_ino = if let Some(&orig_idx) = path_to_idx.get(target) {
+            // Reuse the inode of the original regular file.
+            inodes[orig_idx]
+        } else {
+            let ino = next_ino;
+            next_ino += 1;
+            ino
+        };
+
+        // Total nlink = original file (if present) + all hardlinks in group.
+        let has_original = path_to_idx.contains_key(target);
+        let total_nlink = indices.len() as u32 + if has_original { 1 } else { 0 };
+
+        for &idx in indices {
+            inodes[idx] = shared_ino;
+            nlinks[idx] = total_nlink;
+        }
+
+        // Update the original file's nlink too.
+        if let Some(&orig_idx) = path_to_idx.get(target) {
+            nlinks[orig_idx] = total_nlink;
+        }
+    }
+
+    InodeMap { inodes, nlinks }
+}
+
 /// Convert a FileEntry to CpioMetadata.
-fn file_entry_to_cpio_metadata(entry: &FileEntry) -> CpioMetadata {
+fn file_entry_to_cpio_metadata(entry: &FileEntry, ino: u32, nlink: u32) -> CpioMetadata {
     let filesize = match &entry.entry_type {
         EntryType::RegularFile => entry.size,
         EntryType::Directory => 0,
@@ -591,11 +707,11 @@ fn file_entry_to_cpio_metadata(entry: &FileEntry) -> CpioMetadata {
     let mode = file_mode_with_type(entry);
 
     CpioMetadata {
-        ino: 0, // Sequential inodes handled by the cpio writer index
+        ino,
         mode,
         uid: 0,
         gid: 0,
-        nlink: 1,
+        nlink,
         mtime: 0,
         filesize,
         devmajor: 0,
@@ -723,6 +839,19 @@ fn sha256_file(path: &Path) -> Result<String, RpmError> {
 }
 
 /// Get the hostname for BUILDHOST tag.
+/// Clamp a Unix timestamp to i32::MAX (2038-01-19) since RPM uses INT32.
+fn clamp_timestamp(secs: u64) -> i32 {
+    if secs > i32::MAX as u64 {
+        eprintln!(
+            "warning: timestamp {secs} exceeds RPM INT32 limit (2038-01-19), clamping to {}",
+            i32::MAX
+        );
+        i32::MAX
+    } else {
+        secs as i32
+    }
+}
+
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "localhost".into())
@@ -997,7 +1126,7 @@ mod tests {
         config.package.dependencies.conflicts = vec!["otherpkg >= 2.0".into()];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1010,7 +1139,7 @@ mod tests {
         config.package.dependencies.replaces = vec!["oldpkg < 1.0".into()];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1029,7 +1158,7 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8)).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8), "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1048,7 +1177,7 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9)).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9), "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1067,7 +1196,7 @@ mod tests {
         }];
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1079,7 +1208,7 @@ mod tests {
         let config = make_test_config();
 
         let mut hdr = HeaderBuilder::new();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None).unwrap();
+        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, None, "testpkg", "1.0", "1").unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);

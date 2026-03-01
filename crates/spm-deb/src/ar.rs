@@ -59,7 +59,7 @@ impl<W: Write> ArWriter<W> {
         self.ensure_magic()?;
         self.write_header(name, data.len() as u64, mtime, mode)?;
         self.writer.write_all(data)?;
-        if data.len() % 2 != 0 {
+        if !data.len().is_multiple_of(2) {
             self.writer.write_all(b"\n")?;
         }
         Ok(())
@@ -71,7 +71,7 @@ impl<W: Write> ArWriter<W> {
     pub fn begin_member(&mut self, name: &str, size: u64, mtime: u64, mode: u32) -> io::Result<()> {
         self.ensure_magic()?;
         self.write_header(name, size, mtime, mode)?;
-        self.needs_pad = size % 2 != 0;
+        self.needs_pad = !size.is_multiple_of(2);
         Ok(())
     }
 
@@ -117,6 +117,16 @@ impl<W: Write> ArWriter<W> {
             ));
         }
         let name_field = format!("{name}/");
+        if name_field.len() > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "ar member name '{name}' is too long ({} bytes); \
+                     maximum is 15 characters",
+                    name.len(),
+                ),
+            ));
+        }
         write!(
             self.writer,
             "{:<16}{:<12}{:<6}{:<6}{:<8o}{:<10}",

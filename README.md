@@ -31,7 +31,8 @@ spm plan --config spm.yaml --format deb
 - [x] Phase 0: Workspace scaffolding, config parsing, validation, CLI (`validate`, `init`)
 - [x] Phase 1: File tree walking & package planning (`plan`)
 - [x] Phase 2: Compression engine (zstd multi-threaded, gzip, passthrough)
-- [ ] Phase 3: CPIO writer & RPM backend
-- [ ] Phase 4: DEB backend & auto-split
-- [ ] Phase 5: Full CLI, distro compat, polish
+- [x] Phase 3: CPIO writer & RPM backend
+- [x] Phase 4: DEB backend & auto-split
+- [x] Phase 5a: XZ compression, distro compat DB, RPM builder gaps, config validation
+- [x] Phase 5b: CLI integration (`build`, `plan`, `inspect`), RPM/DEB readers, spinners
 - [ ] Phase 6: Signing

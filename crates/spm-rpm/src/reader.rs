@@ -150,6 +150,20 @@ fn parse_header_section<R: Read>(reader: &mut R) -> Result<Vec<(u32, ParsedTagVa
     let index_count = u32::from_be_bytes(preamble[8..12].try_into().unwrap()) as usize;
     let data_size = u32::from_be_bytes(preamble[12..16].try_into().unwrap()) as usize;
 
+    // Guard against excessively large headers from malformed/malicious RPMs.
+    const MAX_INDEX_COUNT: usize = 100_000;
+    const MAX_DATA_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    if index_count > MAX_INDEX_COUNT {
+        return Err(RpmError::InvalidRpm(format!(
+            "header index_count {index_count} exceeds maximum {MAX_INDEX_COUNT}"
+        )));
+    }
+    if data_size > MAX_DATA_SIZE {
+        return Err(RpmError::InvalidRpm(format!(
+            "header data_size {data_size} exceeds maximum {MAX_DATA_SIZE}"
+        )));
+    }
+
     // Read all index entries.
     let mut index_buf = vec![0u8; index_count * 16];
     reader.read_exact(&mut index_buf)?;

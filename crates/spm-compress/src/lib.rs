@@ -136,12 +136,70 @@ impl CompressorConfig {
     }
 }
 
+/// A compressing writer with explicit finalization.
+///
+/// Unlike a plain `Box<dyn Write>`, this type exposes a [`finish()`](FinishableWriter::finish)
+/// method that properly finalizes the compression stream and propagates any errors.
+/// This avoids the silent error swallowing that occurs when relying on `Drop` for
+/// gzip and xz encoders.
+pub struct FinishableWriter<'a> {
+    inner: FinishableInner<'a>,
+}
+
+enum FinishableInner<'a> {
+    Zstd(Box<dyn Write + 'a>),
+    Gzip(flate2::write::GzEncoder<Box<dyn Write + 'a>>),
+    Xz(xz2::write::XzEncoder<Box<dyn Write + 'a>>),
+    None(Box<dyn Write + 'a>),
+}
+
+impl<'a> Write for FinishableWriter<'a> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut self.inner {
+            FinishableInner::Zstd(w) => w.write(buf),
+            FinishableInner::Gzip(w) => w.write(buf),
+            FinishableInner::Xz(w) => w.write(buf),
+            FinishableInner::None(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.inner {
+            FinishableInner::Zstd(w) => w.flush(),
+            FinishableInner::Gzip(w) => w.flush(),
+            FinishableInner::Xz(w) => w.flush(),
+            FinishableInner::None(w) => w.flush(),
+        }
+    }
+}
+
+impl<'a> FinishableWriter<'a> {
+    /// Finalize the compression stream, flushing all buffered data.
+    ///
+    /// This must be called before measuring the output size. Unlike `drop()`,
+    /// this method propagates any errors that occur during finalization.
+    pub fn finish(self) -> std::io::Result<()> {
+        match self.inner {
+            FinishableInner::Zstd(mut w) => w.flush(),
+            FinishableInner::Gzip(w) => {
+                w.finish()?;
+                Ok(())
+            }
+            FinishableInner::Xz(w) => {
+                w.finish()?;
+                Ok(())
+            }
+            FinishableInner::None(mut w) => w.flush(),
+        }
+    }
+}
+
 /// Create a compressing writer that wraps an output writer.
 ///
 /// Data written to the returned writer is compressed using the configured
-/// algorithm and flushed to the underlying `output` writer. The caller must
-/// drop the returned writer (or let it go out of scope) to flush all
-/// buffered compression state.
+/// algorithm. The caller **must** call [`FinishableWriter::finish()`] to
+/// finalize the compression stream and propagate any errors. Relying on
+/// `drop()` alone may silently discard finalization errors for gzip and xz.
 ///
 /// # Errors
 ///
@@ -149,19 +207,24 @@ impl CompressorConfig {
 pub fn compress_writer<'a, W: Write + 'a>(
     config: &CompressorConfig,
     output: W,
-) -> Result<Box<dyn Write + 'a>, CompressError> {
+) -> Result<FinishableWriter<'a>, CompressError> {
+    let boxed: Box<dyn Write + 'a> = Box::new(output);
     match config.algorithm {
         Algorithm::Zstd => {
-            let mut encoder = zstd::stream::Encoder::new(output, config.effective_level())?;
+            let mut encoder = zstd::stream::Encoder::new(boxed, config.effective_level())?;
             encoder.multithread(config.effective_threads() as u32)?;
-            Ok(Box::new(encoder.auto_finish()))
+            Ok(FinishableWriter {
+                inner: FinishableInner::Zstd(Box::new(encoder.auto_finish())),
+            })
         }
         Algorithm::Gzip => {
             let encoder = flate2::write::GzEncoder::new(
-                output,
+                boxed,
                 flate2::Compression::new(config.effective_level() as u32),
             );
-            Ok(Box::new(encoder))
+            Ok(FinishableWriter {
+                inner: FinishableInner::Gzip(encoder),
+            })
         }
         Algorithm::Xz => {
             let level = config.effective_level() as u32;
@@ -172,14 +235,20 @@ pub fn compress_writer<'a, W: Write + 'a>(
                     .preset(level)
                     .encoder()
                     .map_err(|e| {
-                        CompressError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                        CompressError::Io(std::io::Error::other(e))
                     })?;
-                Ok(Box::new(xz2::write::XzEncoder::new_stream(output, stream)))
+                Ok(FinishableWriter {
+                    inner: FinishableInner::Xz(xz2::write::XzEncoder::new_stream(boxed, stream)),
+                })
             } else {
-                Ok(Box::new(xz2::write::XzEncoder::new(output, level)))
+                Ok(FinishableWriter {
+                    inner: FinishableInner::Xz(xz2::write::XzEncoder::new(boxed, level)),
+                })
             }
         }
-        Algorithm::None => Ok(Box::new(output)),
+        Algorithm::None => Ok(FinishableWriter {
+            inner: FinishableInner::None(boxed),
+        }),
     }
 }
 

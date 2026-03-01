@@ -11,20 +11,9 @@ use md5::{Digest, Md5};
 use spm_core::config::Config;
 use spm_core::filetree::{EntryType, FileEntry};
 use spm_core::planner::{PackagePlan, SubPackage};
+pub use spm_core::types::deb_arch;
 
 use crate::error::DebError;
-
-/// Map architecture strings from spm (RPM-style) to DEB-style.
-pub fn deb_arch(arch: &str) -> &str {
-    match arch {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "i686" => "i386",
-        "armv7hl" => "armhf",
-        "noarch" | "all" => "all",
-        other => other,
-    }
-}
 
 /// Generate the DEB control file content.
 pub fn generate_control(
@@ -41,7 +30,7 @@ pub fn generate_control(
     lines.push(format!("Maintainer: {}", config.package.maintainer));
 
     // Installed-Size in KiB (rounded up, as per Debian policy).
-    let installed_size_kib = (sub_package.total_size + 1023) / 1024;
+    let installed_size_kib = sub_package.total_size.div_ceil(1024);
     lines.push(format!("Installed-Size: {installed_size_kib}"));
 
     // Section from deb overrides or default "misc".
@@ -104,8 +93,21 @@ pub fn generate_control(
         lines.push(format!("Homepage: {url}"));
     }
 
-    // Description.
-    lines.push(format!("Description: {}", config.package.description));
+    // Description (multi-line formatted per Debian policy §5.6.13).
+    let desc = &config.package.description;
+    let desc_lines: Vec<&str> = desc.lines().collect();
+    if let Some(first_line) = desc_lines.first() {
+        lines.push(format!("Description: {first_line}"));
+        for line in desc_lines.iter().skip(1) {
+            if line.is_empty() {
+                lines.push(" .".to_string());
+            } else {
+                lines.push(format!(" {line}"));
+            }
+        }
+    } else {
+        lines.push("Description: ".to_string());
+    }
 
     // Extra fields from deb.fields.
     if let Some(deb) = &config.deb {
@@ -126,7 +128,14 @@ pub fn generate_conffiles(files: &[FileEntry]) -> Option<String> {
     let conf_paths: Vec<String> = files
         .iter()
         .filter(|f| f.is_config && matches!(f.entry_type, EntryType::RegularFile))
-        .map(|f| f.install_path.to_string_lossy().to_string())
+        .map(|f| {
+            let path = f.install_path.to_string_lossy().to_string();
+            if path.starts_with('/') {
+                path
+            } else {
+                format!("/{path}")
+            }
+        })
         .collect();
 
     if conf_paths.is_empty() {

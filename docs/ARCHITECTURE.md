@@ -104,7 +104,8 @@ spm-cpio      (standalone, only depends on thiserror)
 
 - `Algorithm` — `Zstd`, `Gzip`, `Xz`, `None`. Methods: `from_str()`, `extension()`, `rpm_tag()`, `estimated_ratio()`.
 - `CompressorConfig` — Algorithm, level, thread count. Resolves defaults via `effective_level()` and `effective_threads()`.
-- `compress_writer()` — Creates a `Box<dyn Write>` that compresses data written to it. Supports zstd (multi-threaded), gzip, xz (multi-threaded), none (passthrough).
+- `FinishableWriter` — Wrapper around compressor streams with an explicit `finish()` method that finalizes compression and returns `io::Result<()>`. Implements `Write` for transparent use in streaming pipelines.
+- `compress_writer()` — Creates a `FinishableWriter` that compresses data written to it. Supports zstd (multi-threaded), gzip, xz (multi-threaded), none (passthrough). Callers **must** call `.finish()` to flush and finalize the compressor — relying on `Drop` silently discards gzip/xz finalization errors.
 - `decompress_reader()` — Creates a `Box<dyn Read>` that decompresses data read from it. Supports zstd, gzip, xz, none (passthrough).
 - `CompressError` — `Io`, `Unsupported`.
 

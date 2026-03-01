@@ -362,8 +362,11 @@ fn expand_glob_pattern(pattern: &str) -> Result<Vec<PathBuf>, FileTreeError> {
                 pattern: pattern.to_string(),
                 source: e,
             })?
-            .filter_map(|result| result.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| FileTreeError::Metadata {
+                path: PathBuf::from(pattern),
+                source: e.into_error(),
+            })?;
         Ok(paths)
     }
 }
@@ -391,7 +394,9 @@ fn glob_base_path(pattern: &str) -> PathBuf {
 
 /// Parse an octal mode string like "0755" into a u32.
 fn parse_mode(mode_str: &str) -> Result<u32, FileTreeError> {
-    u32::from_str_radix(mode_str.trim_start_matches('0'), 8).map_err(|_| {
+    let stripped = mode_str.trim_start_matches('0');
+    let s = if stripped.is_empty() { "0" } else { stripped };
+    u32::from_str_radix(s, 8).map_err(|_| {
         FileTreeError::InvalidMapping {
             src: String::new(),
             dst: String::new(),
@@ -842,6 +847,9 @@ mod tests {
         assert_eq!(parse_mode("0644").unwrap(), 0o644);
         assert_eq!(parse_mode("755").unwrap(), 0o755);
         assert_eq!(parse_mode("0750").unwrap(), 0o750);
+        assert_eq!(parse_mode("0000").unwrap(), 0);
+        assert_eq!(parse_mode("0").unwrap(), 0);
+        assert_eq!(parse_mode("00644").unwrap(), 0o644);
     }
 
     #[test]

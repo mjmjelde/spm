@@ -7,6 +7,14 @@ use std::path::Path;
 use crate::config::{AlternativeConfig, ScriptsConfig};
 use crate::error::PlanError;
 
+/// Shell-escape a string using single quotes (POSIX-safe).
+///
+/// Wraps the value in single quotes and escapes any embedded single
+/// quotes as `'\''` (end quote, escaped quote, start quote).
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Resolved script contents with alternatives scriptlets injected.
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedScripts {
@@ -34,12 +42,17 @@ pub fn generate_install_scriptlet(alternatives: &[AlternativeConfig]) -> Option<
     for alt in alternatives {
         let mut cmd = format!(
             "update-alternatives \\\n  --install {} {} {} {}",
-            alt.link, alt.name, alt.path, alt.priority
+            shell_escape(&alt.link),
+            shell_escape(&alt.name),
+            shell_escape(&alt.path),
+            alt.priority
         );
         for follower in &alt.followers {
             cmd.push_str(&format!(
                 " \\\n  --slave {} {} {}",
-                follower.link, follower.name, follower.path
+                shell_escape(&follower.link),
+                shell_escape(&follower.name),
+                shell_escape(&follower.path)
             ));
         }
         lines.push(cmd);
@@ -66,7 +79,8 @@ pub fn generate_remove_scriptlet(alternatives: &[AlternativeConfig]) -> Option<S
     for alt in alternatives {
         lines.push(format!(
             "  update-alternatives --remove {} {}",
-            alt.name, alt.path
+            shell_escape(&alt.name),
+            shell_escape(&alt.path)
         ));
     }
 
@@ -182,18 +196,17 @@ mod tests {
     fn test_install_scriptlet_basic() {
         let script = generate_install_scriptlet(&[matlab_alt()]).unwrap();
         assert!(script.contains("# [spm:alternatives]"));
-        assert!(
-            script.contains("--install /usr/bin/matlab matlab /opt/matlab/R2025a/bin/matlab 2025")
-        );
+        assert!(script
+            .contains("--install '/usr/bin/matlab' 'matlab' '/opt/matlab/R2025a/bin/matlab' 2025"));
         assert!(!script.contains("--slave"));
     }
 
     #[test]
     fn test_install_scriptlet_with_followers() {
         let script = generate_install_scriptlet(&[matlab_alt_with_followers()]).unwrap();
-        assert!(script.contains("--slave /usr/bin/mex mex /opt/matlab/R2025a/bin/mex"));
+        assert!(script.contains("--slave '/usr/bin/mex' 'mex' '/opt/matlab/R2025a/bin/mex'"));
         assert!(script.contains(
-            "--slave /usr/bin/matlab-help matlab-help /opt/matlab/R2025a/bin/matlab-help"
+            "--slave '/usr/bin/matlab-help' 'matlab-help' '/opt/matlab/R2025a/bin/matlab-help'"
         ));
     }
 
@@ -203,9 +216,8 @@ mod tests {
         assert!(script.contains("# [spm:alternatives]"));
         assert!(script.contains("\"$1\" = \"0\""));
         assert!(script.contains("\"$1\" = \"remove\""));
-        assert!(
-            script.contains("update-alternatives --remove matlab /opt/matlab/R2025a/bin/matlab")
-        );
+        assert!(script
+            .contains("update-alternatives --remove 'matlab' '/opt/matlab/R2025a/bin/matlab'"));
         assert!(script.contains("fi"));
     }
 
@@ -235,12 +247,12 @@ mod tests {
         ];
 
         let install = generate_install_scriptlet(&alts).unwrap();
-        assert!(install.contains("--install /usr/bin/matlab matlab"));
-        assert!(install.contains("--install /usr/bin/python python"));
+        assert!(install.contains("--install '/usr/bin/matlab' 'matlab'"));
+        assert!(install.contains("--install '/usr/bin/python' 'python'"));
 
         let remove = generate_remove_scriptlet(&alts).unwrap();
-        assert!(remove.contains("--remove matlab"));
-        assert!(remove.contains("--remove python"));
+        assert!(remove.contains("--remove 'matlab'"));
+        assert!(remove.contains("--remove 'python'"));
     }
 
     #[test]
@@ -329,5 +341,30 @@ mod tests {
         let result = resolve_scripts(&scripts_config, &[], tmp.path());
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), PlanError::ScriptRead { .. }));
+    }
+
+    #[test]
+    fn test_shell_escape_special_characters() {
+        assert_eq!(shell_escape("simple"), "'simple'");
+        assert_eq!(shell_escape("path with spaces"), "'path with spaces'");
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+        assert_eq!(shell_escape("; rm -rf /"), "'; rm -rf /'");
+    }
+
+    #[test]
+    fn test_scriptlet_paths_with_special_chars() {
+        let alt = AlternativeConfig {
+            name: "my app".to_string(),
+            link: "/usr/bin/my app".to_string(),
+            path: "/opt/my app/bin/tool".to_string(),
+            priority: 100,
+            followers: vec![],
+        };
+        let script = generate_install_scriptlet(&[alt]).unwrap();
+        assert!(script.contains("'/usr/bin/my app'"));
+        assert!(script.contains("'my app'"));
+        assert!(script.contains("'/opt/my app/bin/tool'"));
+        // Should not contain unquoted paths.
+        assert!(!script.contains("--install /usr/bin/my app"));
     }
 }

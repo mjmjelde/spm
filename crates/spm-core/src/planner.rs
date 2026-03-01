@@ -385,31 +385,64 @@ fn split_by_size(
     max_size_per_part: u64,
     _pkg_name: &str,
 ) -> Vec<(Vec<FileEntry>, u64)> {
-    let mut parts: Vec<(Vec<FileEntry>, u64)> = Vec::new();
+    // Separate directories from non-directory entries.
+    let mut dirs: Vec<FileEntry> = Vec::new();
+    let mut non_dirs: Vec<FileEntry> = Vec::new();
+    for entry in files {
+        if matches!(entry.entry_type, EntryType::Directory) {
+            dirs.push(entry);
+        } else {
+            non_dirs.push(entry);
+        }
+    }
+
+    // Split non-directory entries by size.
+    let mut raw_parts: Vec<(Vec<FileEntry>, u64)> = Vec::new();
     let mut current_files: Vec<FileEntry> = Vec::new();
     let mut current_size: u64 = 0;
 
-    for entry in files {
-        // Directories go in whatever part their first file is in.
-        // Don't count them toward the size limit.
-        if matches!(entry.entry_type, EntryType::Directory) {
-            current_files.push(entry);
-            continue;
-        }
-
+    for entry in non_dirs {
         if current_size + entry.size > max_size_per_part && !current_files.is_empty() {
-            parts.push((std::mem::take(&mut current_files), current_size));
+            raw_parts.push((std::mem::take(&mut current_files), current_size));
             current_size = 0;
         }
         current_size += entry.size;
         current_files.push(entry);
     }
-
     if !current_files.is_empty() {
-        parts.push((current_files, current_size));
+        raw_parts.push((current_files, current_size));
     }
 
-    parts
+    // Inject required directory entries into each part.
+    // Each part gets directory entries for all ancestor paths of its files.
+    for (part_files, _) in &mut raw_parts {
+        let mut needed_dirs: std::collections::BTreeSet<&Path> =
+            std::collections::BTreeSet::new();
+        for f in part_files.iter() {
+            let mut p = f.install_path.parent();
+            while let Some(ancestor) = p {
+                if ancestor == Path::new("") || ancestor == Path::new("/") {
+                    break;
+                }
+                if !needed_dirs.insert(ancestor) {
+                    break; // already seen this and all its ancestors
+                }
+                p = ancestor.parent();
+            }
+        }
+
+        let mut dir_entries: Vec<FileEntry> = Vec::new();
+        for dir in &dirs {
+            if needed_dirs.contains(dir.install_path.as_path()) {
+                dir_entries.push(dir.clone());
+            }
+        }
+        // Sort dirs before files so directory entries precede their children.
+        dir_entries.append(part_files);
+        *part_files = dir_entries;
+    }
+
+    raw_parts
 }
 
 /// Split files into parts by directory path boundaries.
@@ -472,15 +505,16 @@ fn fixup_hardlinks_across_parts(parts: &mut [(Vec<FileEntry>, u64)]) {
                 // Check if the target is in this same part.
                 if !part_paths[part_idx].contains(target) {
                     // Target is in a different part — convert to regular file.
-                    // We need to restore the actual file size.
-                    // Since the hardlink entry has size 0, we read the size from
-                    // the source path metadata if available.
-                    let actual_size = std::fs::metadata(&entry.source_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    entry.entry_type = EntryType::RegularFile;
-                    entry.size = actual_size;
-                    *total_size += actual_size;
+                    // Read actual size from source path; skip conversion if
+                    // source_path is empty (synthetic entry) to avoid zero-size files.
+                    if !entry.source_path.as_os_str().is_empty() {
+                        let actual_size = std::fs::metadata(&entry.source_path)
+                            .map(|m| m.len())
+                            .unwrap_or(entry.size);
+                        entry.entry_type = EntryType::RegularFile;
+                        entry.size = actual_size;
+                        *total_size += actual_size;
+                    }
                 }
             }
         }
@@ -976,5 +1010,61 @@ mod tests {
         ];
 
         assert_eq!(count_files(&files), 3); // 2 regular + 1 symlink, no dirs
+    }
+
+    #[test]
+    fn test_split_by_size_directories_in_all_parts() {
+        let mib = 1024 * 1024u64;
+        // Sorted input: directories first, then files.
+        let files = vec![
+            test_dir("/opt"),
+            test_dir("/opt/pkg"),
+            test_dir("/opt/pkg/bin"),
+            test_file("/opt/pkg/bin/a.bin", 50 * mib),
+            test_file("/opt/pkg/bin/b.bin", 50 * mib),
+            test_file("/opt/pkg/bin/c.bin", 50 * mib),
+        ];
+
+        let parts = split_by_size(files, 80 * mib, "testpkg");
+
+        // Should split into at least 2 parts.
+        assert!(parts.len() >= 2, "expected >= 2 parts, got {}", parts.len());
+
+        // Every part should contain the directory entries for /opt, /opt/pkg, /opt/pkg/bin.
+        for (i, (part_files, _)) in parts.iter().enumerate() {
+            let dir_paths: Vec<&Path> = part_files
+                .iter()
+                .filter(|e| matches!(e.entry_type, EntryType::Directory))
+                .map(|e| e.install_path.as_path())
+                .collect();
+            assert!(
+                dir_paths.contains(&Path::new("/opt")),
+                "part {i} missing /opt directory"
+            );
+            assert!(
+                dir_paths.contains(&Path::new("/opt/pkg")),
+                "part {i} missing /opt/pkg directory"
+            );
+            assert!(
+                dir_paths.contains(&Path::new("/opt/pkg/bin")),
+                "part {i} missing /opt/pkg/bin directory"
+            );
+        }
+
+        // Directories should come before files in each part.
+        for (i, (part_files, _)) in parts.iter().enumerate() {
+            let first_file_idx = part_files
+                .iter()
+                .position(|e| !matches!(e.entry_type, EntryType::Directory));
+            let last_dir_idx = part_files
+                .iter()
+                .rposition(|e| matches!(e.entry_type, EntryType::Directory));
+            if let (Some(first_file), Some(last_dir)) = (first_file_idx, last_dir_idx) {
+                assert!(
+                    last_dir < first_file,
+                    "part {i}: directories should precede files"
+                );
+            }
+        }
     }
 }

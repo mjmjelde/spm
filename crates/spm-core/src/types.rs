@@ -45,6 +45,20 @@ pub struct PackageFileName {
     pub format: String,
 }
 
+/// Map architecture strings from spm (RPM-style) to DEB-style.
+///
+/// DEB uses `amd64` instead of `x86_64`, `arm64` instead of `aarch64`, etc.
+pub fn deb_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "i686" => "i386",
+        "armv7hl" => "armhf",
+        "noarch" | "all" => "all",
+        other => other,
+    }
+}
+
 impl PackageFileName {
     /// Generate the output filename for RPM format.
     pub fn rpm(name: &str, version: &str, release: &str, arch: &str) -> String {
@@ -52,17 +66,8 @@ impl PackageFileName {
     }
 
     /// Generate the output filename for DEB format.
-    /// DEB uses amd64 instead of x86_64, arm64 instead of aarch64.
     pub fn deb(name: &str, version: &str, release: &str, arch: &str) -> String {
-        let deb_arch = match arch {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            "i686" => "i386",
-            "armv7hl" => "armhf",
-            "noarch" | "all" => "all",
-            other => other,
-        };
-        format!("{name}_{version}-{release}_{deb_arch}.deb")
+        format!("{name}_{version}-{release}_{}.deb", deb_arch(arch))
     }
 }
 

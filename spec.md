@@ -337,6 +337,15 @@ build:
 2. CLI flags override any config file values
 3. Environment variables expand in string values (`${VAR}` syntax)
 
+### 3.4 Name and Version Validation
+
+spm validates `package.name` and `package.version` at config load time:
+
+- **Name:** Must match `[a-zA-Z0-9][a-zA-Z0-9._+-]*` — starts with alphanumeric, then alphanumerics, dots, underscores, hyphens, or plus signs. This is the intersection of valid RPM and DEB package name characters.
+- **Version:** Must match `[0-9][^\s:]*` — starts with a digit, contains no whitespace or colons. Colons conflict with the epoch separator in both RPM and DEB version schemes.
+
+Invalid names/versions produce a `ConfigError::InvalidPackageName` or `ConfigError::InvalidPackageVersion` error at parse time, before any planning or building occurs.
+
 ---
 
 ## 4. Package Planning & Auto-Split
@@ -388,7 +397,8 @@ The split algorithm produces **even-sized parts** rather than greedily filling e
 4. Divide total uncompressed size evenly: `max_per_part = total_uncompressed / num_parts`
 5. Sort files by directory path (keeps related files together)
 6. Distribute files into parts using the even per-part limit
-7. Generate a meta-package that depends on all parts
+7. Inject parent directory entries into each part — every part must contain the directory entries for all ancestor paths of its files (e.g., if a part contains `/opt/app/bin/tool`, it must also contain entries for `/opt/app/bin/`, `/opt/app/`, and `/opt/`)
+8. Generate a meta-package that depends on all parts
 
 **Borderline warnings:** When `estimated` exceeds the safety threshold but is still under the raw format limit, the plan output warns that splitting was triggered by the safety margin. When a package is not split but estimated size exceeds 60% of the limit, a warning suggests enabling splitting for safety.
 
@@ -680,16 +690,18 @@ spm generates and injects the following scriptlets:
 ```bash
 # [spm:alternatives] Auto-generated — do not edit
 update-alternatives \
-  --install /usr/bin/matlab matlab /opt/matlab/R2025a/bin/matlab 2025 \
-  --slave /usr/bin/mex mex /opt/matlab/R2025a/bin/mex
+  --install '/usr/bin/matlab' 'matlab' '/opt/matlab/R2025a/bin/matlab' 2025 \
+  --slave '/usr/bin/mex' 'mex' '/opt/matlab/R2025a/bin/mex'
 ```
+
+All path and name arguments are single-quoted using POSIX shell escaping (embedded `'` is escaped as `'\''`) to prevent shell injection or breakage from paths containing spaces or metacharacters.
 
 **Pre-remove** (appended after user's `pre_remove` script):
 
 ```bash
 # [spm:alternatives] Auto-generated — do not edit
 if [ "$1" = "0" ] || [ "$1" = "remove" ]; then
-  update-alternatives --remove matlab /opt/matlab/R2025a/bin/matlab
+  update-alternatives --remove 'matlab' '/opt/matlab/R2025a/bin/matlab'
 fi
 ```
 

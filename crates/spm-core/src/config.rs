@@ -384,10 +384,44 @@ impl Config {
                 "package.name is required".to_string(),
             ));
         }
+        // Package name: alphanumeric, hyphens, dots, underscores, plus signs.
+        if !self
+            .package
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '+')
+        {
+            return Err(ConfigError::Validation(format!(
+                "package.name '{}' contains invalid characters; \
+                 only alphanumeric, hyphens, dots, underscores, and plus signs are allowed",
+                self.package.name
+            )));
+        }
         if self.package.version.is_empty() {
             return Err(ConfigError::Validation(
                 "package.version is required".to_string(),
             ));
+        }
+        // Version: must start with a digit, no spaces or colons.
+        if !self
+            .package
+            .version
+            .starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Err(ConfigError::Validation(format!(
+                "package.version '{}' must start with a digit",
+                self.package.version
+            )));
+        }
+        if self
+            .package
+            .version
+            .contains(|c: char| c.is_whitespace() || c == ':')
+        {
+            return Err(ConfigError::Validation(format!(
+                "package.version '{}' contains invalid characters (no spaces or colons allowed)",
+                self.package.version
+            )));
         }
         let valid_arches = ["x86_64", "aarch64", "i686", "armv7hl", "noarch", "all"];
         if !valid_arches.contains(&self.package.arch.as_str()) {

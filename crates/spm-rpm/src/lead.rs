@@ -62,7 +62,7 @@ pub fn write_lead<W: Write>(writer: &mut W, name: &str, arch: &str) -> Result<()
 pub fn arch_to_num(arch: &str) -> u16 {
     match arch {
         "x86_64" | "i686" | "i386" | "i486" | "i586" => 1,
-        "aarch64" => 12,
+        "aarch64" => 19,
         "armv7hl" | "armv7l" => 12,
         "ppc64le" => 16,
         "s390x" => 15,
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_arch_to_num() {
         assert_eq!(arch_to_num("x86_64"), 1);
-        assert_eq!(arch_to_num("aarch64"), 12);
+        assert_eq!(arch_to_num("aarch64"), 19);
         assert_eq!(arch_to_num("noarch"), 0);
         assert_eq!(arch_to_num("unknown"), 0);
     }

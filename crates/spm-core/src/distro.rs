@@ -44,6 +44,7 @@ impl Distro {
     /// Parse a distro identifier from a CLI string.
     ///
     /// Accepts: `"el8"`, `"el9"`, `"ubuntu2004"`, `"ubuntu2204"`, `"ubuntu2404"`, `"fedora"`.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "el8" | "rhel8" => Some(Self::El8),

@@ -70,7 +70,7 @@ fn find_control_tar(data: &[u8]) -> Result<(&str, &[u8]), DebError> {
             // Return name from header and the data slice.
             let name_str = std::str::from_utf8(&data[offset..offset + 16])
                 .unwrap_or("")
-                .trim_end_matches(|c: char| c == '/' || c == ' ');
+                .trim_end_matches(['/', ' ']);
             return Ok((name_str, &data[data_offset..data_offset + data_size]));
         }
 
@@ -99,7 +99,7 @@ fn parse_ar_header(data: &[u8], offset: usize) -> Result<(String, usize, usize, 
     // Name is first 16 bytes, right-padded with spaces.
     let name = std::str::from_utf8(&header[0..16])
         .unwrap_or("")
-        .trim_end_matches(|c: char| c == '/' || c == ' ')
+        .trim_end_matches(['/', ' '])
         .to_string();
 
     // Size is bytes 48..58, ASCII decimal, space-padded.

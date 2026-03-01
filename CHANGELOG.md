@@ -82,6 +82,44 @@
 - Improved error messages with source file paths and context
 - 28 new tests (204 total)
 
+### Deep Analysis: Correctness, Security, and Compliance Fixes
+
+Comprehensive codebase audit identified ~60 issues; 25 fixes implemented with 10 new tests (226 → 236 total).
+
+**Correctness-critical:**
+- Fixed `split_by_size` omitting directory entries from parts 2+ — all parts now include parent
+  directory entries for their files
+- Fixed `parse_mode("0000")` producing an error (empty string after zero-trim)
+- Fixed aarch64 architecture number in RPM lead (was 12/armv7, now 19)
+- Added `FinishableWriter` to spm-compress with explicit `finish()` — gzip/xz finalization
+  errors were silently discarded by `Drop`
+- Fixed hardlink inode/nlink handling in CPIO — entries now share inodes and have correct nlink
+  via `InodeMap`
+
+**Security & robustness:**
+- Added POSIX shell escaping (`shell_escape()`) for all path arguments in alternatives
+  scriptlets — prevents shell injection from paths with spaces or metacharacters
+- Added ar header name field overflow protection (name + "/" must fit in 16 bytes)
+- Added Year-2038 timestamp clamping (`clamp_timestamp()`) for RPM INT32 fields
+- Added RPM reader allocation limits (100K index entries, 64 MiB data) to prevent DoS from
+  crafted packages
+
+**Format compliance:**
+- Fixed self-provides to use `sub_package.name` and plan version/release (was using config name)
+- Fixed multi-line DEB Description formatting per Debian policy (continuation lines with space
+  prefix, empty lines as ` .`)
+- Added conffiles path validation (must start with `/`)
+- Added `rpmlib(PayloadIsXz)` auto-dependency when using XZ compression
+- Changed SOURCERPM from empty string to `"(none)"` per RPM convention
+- Changed symlink target handling to error on non-UTF-8 instead of `to_string_lossy()`
+
+**Code quality:**
+- Fixed glob errors silently swallowed (now propagated as `FileTreeError`)
+- Deduplicated DEB arch mapping to `spm_core::types::deb_arch()`
+- Added zero-size safety in `fixup_hardlinks_across_parts`
+- Added header data offset overflow check (`> i32::MAX`)
+- Added package name/version format validation at config load time
+
 ### Phase 5b: CLI Integration — Build Flags, Inspect, Spinners
 
 - Added `decompress_reader()` to `spm-compress` for unified decompression (Zstd, Gzip, Xz, None)
