@@ -565,7 +565,7 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.entry_type, EntryType::Directory))
             .collect();
-        assert!(dir_entries.len() >= 1); // At least bin/ dir
+        assert!(!dir_entries.is_empty()); // At least bin/ dir
 
         // Verify install paths.
         let install_paths: Vec<String> = entries
@@ -728,7 +728,7 @@ mod tests {
         let entries = FileTree::walk(&content).unwrap();
         let dir = entries
             .iter()
-            .find(|e| e.install_path == PathBuf::from("/var/log/app"))
+            .find(|e| e.install_path == Path::new("/var/log/app"))
             .unwrap();
         assert!(matches!(dir.entry_type, EntryType::Directory));
         assert_eq!(dir.mode, 0o750);
@@ -970,13 +970,13 @@ mod tests {
 
         let file_a = entries
             .iter()
-            .find(|e| e.install_path == PathBuf::from("/opt/app/file_a"))
+            .find(|e| e.install_path == Path::new("/opt/app/file_a"))
             .unwrap();
         assert_eq!(file_a.user, "nobody");
 
         let file_b = entries
             .iter()
-            .find(|e| e.install_path == PathBuf::from("/opt/app/file_b"))
+            .find(|e| e.install_path == Path::new("/opt/app/file_b"))
             .unwrap();
         assert_eq!(file_b.user, "root");
     }

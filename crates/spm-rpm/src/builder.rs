@@ -1302,7 +1302,7 @@ mod tests {
         };
 
         let mut hdr = HeaderBuilder::new();
-        let inode_map = build_inode_map(&[big_file.clone()]);
+        let inode_map = build_inode_map(std::slice::from_ref(&big_file));
         let digests = vec!["d41d8cd98f00b204e9800998ecf8427e".to_owned()];
 
         let result = add_file_metadata(&mut hdr, &[big_file], false, &digests, &inode_map);
@@ -1331,7 +1331,7 @@ mod tests {
         };
 
         let mut hdr = HeaderBuilder::new();
-        let inode_map = build_inode_map(&[big_file.clone()]);
+        let inode_map = build_inode_map(std::slice::from_ref(&big_file));
         let digests = vec!["d41d8cd98f00b204e9800998ecf8427e".to_owned()];
 
         let result = add_file_metadata(&mut hdr, &[big_file], true, &digests, &inode_map);
