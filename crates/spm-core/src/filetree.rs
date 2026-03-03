@@ -191,13 +191,20 @@ fn process_file_mapping(
     };
 
     // If src is a plain directory path (no glob chars), auto-expand to dir/**
-    let (resolved_pattern, is_glob) = if !is_glob && Path::new(&resolved_pattern).is_dir() {
+    // and ensure dst is treated as a directory too.
+    let (resolved_pattern, is_glob, dst) = if !is_glob && Path::new(&resolved_pattern).is_dir() {
+        let dst = if dst.ends_with('/') {
+            dst.to_string()
+        } else {
+            format!("{dst}/")
+        };
         (
             format!("{}/**", resolved_pattern.trim_end_matches('/')),
             true,
+            dst,
         )
     } else {
-        (resolved_pattern, is_glob)
+        (resolved_pattern, is_glob, dst.to_string())
     };
 
     // Expand the pattern to a list of matching paths.
@@ -270,10 +277,10 @@ fn process_file_mapping(
         let install_path = if dst_is_dir {
             // Directory destination: append relative path from glob base.
             let relative = source_path.strip_prefix(&glob_base).unwrap_or(&source_path);
-            PathBuf::from(dst).join(relative)
+            PathBuf::from(&dst).join(relative)
         } else {
             // Direct file-to-file mapping.
-            PathBuf::from(dst)
+            PathBuf::from(&dst)
         };
 
         // Determine entry type and collect metadata.
@@ -590,6 +597,43 @@ mod tests {
         let content = test_content(vec![FileMapping {
             src: format!("{}", base.display()),
             dst: "/opt/testpkg/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
+
+        let entries = FileTree::walk(&content).unwrap();
+
+        let file_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::RegularFile))
+            .collect();
+        assert_eq!(file_entries.len(), 2);
+
+        let install_paths: Vec<String> = entries
+            .iter()
+            .map(|e| e.install_path.to_string_lossy().to_string())
+            .collect();
+        assert!(install_paths.iter().any(|p| p.contains("bin/hello")));
+        assert!(install_paths.iter().any(|p| p.contains("bin/world")));
+    }
+
+    #[test]
+    fn test_walk_directory_src_auto_expand_dst_no_trailing_slash() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+
+        // Create test files.
+        fs::create_dir_all(base.join("bin")).unwrap();
+        fs::write(base.join("bin/hello"), "#!/bin/bash\necho hello").unwrap();
+        fs::write(base.join("bin/world"), "#!/bin/bash\necho world").unwrap();
+
+        // Use a bare directory src AND dst without trailing slash — should still work.
+        let content = test_content(vec![FileMapping {
+            src: format!("{}", base.display()),
+            dst: "/opt/testpkg".to_string(),
             mode: None,
             dir_mode: None,
             user: None,
