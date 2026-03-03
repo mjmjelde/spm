@@ -228,10 +228,8 @@ pub fn compress_writer<'a, W: Write + 'a>(
                     "gzip compression level {level} out of range (0-9)"
                 ))));
             }
-            let encoder = flate2::write::GzEncoder::new(
-                boxed,
-                flate2::Compression::new(level as u32),
-            );
+            let encoder =
+                flate2::write::GzEncoder::new(boxed, flate2::Compression::new(level as u32));
             Ok(FinishableWriter {
                 inner: FinishableInner::Gzip(encoder),
             })
@@ -250,9 +248,7 @@ pub fn compress_writer<'a, W: Write + 'a>(
                     .threads(threads)
                     .preset(level)
                     .encoder()
-                    .map_err(|e| {
-                        CompressError::Io(std::io::Error::other(e))
-                    })?;
+                    .map_err(|e| CompressError::Io(std::io::Error::other(e)))?;
                 Ok(FinishableWriter {
                     inner: FinishableInner::Xz(xz2::write::XzEncoder::new_stream(boxed, stream)),
                 })

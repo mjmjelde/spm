@@ -660,10 +660,7 @@ fn build_inode_map(files: &[FileEntry]) -> InodeMap {
     let mut hardlink_groups: HashMap<&Path, Vec<usize>> = HashMap::new();
     for (i, entry) in files.iter().enumerate() {
         if let EntryType::Hardlink { target } = &entry.entry_type {
-            hardlink_groups
-                .entry(target.as_path())
-                .or_default()
-                .push(i);
+            hardlink_groups.entry(target.as_path()).or_default().push(i);
         }
     }
 
@@ -1211,7 +1208,15 @@ mod tests {
         let mut hdr = HeaderBuilder::new();
         let sub_pkg = make_standalone_sub_pkg();
         let plan = make_standalone_plan();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El8), &sub_pkg, &plan).unwrap();
+        add_dependencies(
+            &mut hdr,
+            &config,
+            &Algorithm::Zstd,
+            Some(&Distro::El8),
+            &sub_pkg,
+            &plan,
+        )
+        .unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1232,7 +1237,15 @@ mod tests {
         let mut hdr = HeaderBuilder::new();
         let sub_pkg = make_standalone_sub_pkg();
         let plan = make_standalone_plan();
-        add_dependencies(&mut hdr, &config, &Algorithm::Zstd, Some(&Distro::El9), &sub_pkg, &plan).unwrap();
+        add_dependencies(
+            &mut hdr,
+            &config,
+            &Algorithm::Zstd,
+            Some(&Distro::El9),
+            &sub_pkg,
+            &plan,
+        )
+        .unwrap();
 
         let bytes = hdr.build().unwrap();
         let data_str = String::from_utf8_lossy(&bytes);
@@ -1293,9 +1306,15 @@ mod tests {
         let digests = vec!["d41d8cd98f00b204e9800998ecf8427e".to_owned()];
 
         let result = add_file_metadata(&mut hdr, &[big_file], false, &digests, &inode_map);
-        assert!(result.is_err(), "should reject file > 2 GiB in non-extended mode");
+        assert!(
+            result.is_err(),
+            "should reject file > 2 GiB in non-extended mode"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("2 GiB"), "error should mention 2 GiB limit: {msg}");
+        assert!(
+            msg.contains("2 GiB"),
+            "error should mention 2 GiB limit: {msg}"
+        );
     }
 
     #[test]

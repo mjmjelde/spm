@@ -17,9 +17,9 @@ use md5::{Digest, Md5};
 use tar::{Builder as TarBuilder, EntryType as TarEntryType, Header as TarHeader};
 
 use spm_compress::{compress_writer, Algorithm, CompressorConfig};
+use spm_core::alternatives::ResolvedScripts;
 use spm_core::config::Config;
 use spm_core::filetree::{EntryType, FileEntry};
-use spm_core::alternatives::ResolvedScripts;
 use spm_core::planner::{HardlinkFamilies, PackagePlan, SubPackage, SubPackageRole};
 use spm_core::progress::{BuildProgress, BuildStage, NoopProgress};
 use spm_core::types::{FormatLimits, PackageFileName};
@@ -69,7 +69,14 @@ impl DebBuilder {
                 Vec::new()
             };
 
-            build_single_deb(sub_pkg, plan, config, &output_path, &extra_depends, Some(prog))?;
+            build_single_deb(
+                sub_pkg,
+                plan,
+                config,
+                &output_path,
+                &extra_depends,
+                Some(prog),
+            )?;
             output_paths.push(output_path);
         }
 
@@ -296,7 +303,10 @@ pub fn build_streaming_split(
     let mut data_tmp = tempfile::NamedTempFile::new()?;
     let mut compressor = compress_writer(
         &compressor_config,
-        CountingWriter { inner: &data_tmp, count: counter.clone() },
+        CountingWriter {
+            inner: &data_tmp,
+            count: counter.clone(),
+        },
     )?;
     let mut tar = TarBuilder::new(compressor);
 
@@ -341,9 +351,7 @@ pub fn build_streaming_split(
         // output file, lagging by at most one zstd block (~128 KB).
         if counter.load(Ordering::Relaxed) >= threshold {
             // Finalize this part.
-            compressor = tar
-                .into_inner()
-                .map_err(|e| DebError::Tar(e.to_string()))?;
+            compressor = tar.into_inner().map_err(|e| DebError::Tar(e.to_string()))?;
             compressor.finish()?;
             let data_size = std::fs::metadata(data_tmp.path())?.len();
 
@@ -362,7 +370,10 @@ pub fn build_streaming_split(
             data_tmp = tempfile::NamedTempFile::new()?;
             compressor = compress_writer(
                 &compressor_config,
-                CountingWriter { inner: &data_tmp, count: counter.clone() },
+                CountingWriter {
+                    inner: &data_tmp,
+                    count: counter.clone(),
+                },
             )?;
             tar = TarBuilder::new(compressor);
 
@@ -376,9 +387,7 @@ pub fn build_streaming_split(
     // Finalize last part.  Always produce at least one part so that
     // all-directory packages (no regular files) still generate a valid .deb.
     if !current_files.is_empty() || parts.is_empty() {
-        compressor = tar
-            .into_inner()
-            .map_err(|e| DebError::Tar(e.to_string()))?;
+        compressor = tar.into_inner().map_err(|e| DebError::Tar(e.to_string()))?;
         compressor.finish()?;
         let data_size = std::fs::metadata(data_tmp.path())?.len();
 
@@ -400,8 +409,7 @@ pub fn build_streaming_split(
     if parts.len() == 1 {
         // Single part — no split actually needed.
         let part = parts.pop().unwrap();
-        let filename =
-            PackageFileName::deb(pkg_name, &plan.version, &plan.release, &plan.arch);
+        let filename = PackageFileName::deb(pkg_name, &plan.version, &plan.release, &plan.arch);
         let output_path = output_dir.join(&filename);
 
         let sub_pkg = SubPackage {
@@ -445,7 +453,14 @@ pub fn build_streaming_split(
             total_size: 0,
             scripts: scripts.clone(),
         };
-        build_single_deb(&meta_sub, plan, config, &meta_path, &extra_depends, Some(prog))?;
+        build_single_deb(
+            &meta_sub,
+            plan,
+            config,
+            &meta_path,
+            &extra_depends,
+            Some(prog),
+        )?;
         output_paths.push(meta_path);
 
         // Part packages.

@@ -536,12 +536,7 @@ fn cmd_build(
                     // sizes and partitions automatically.
                     let label = format!(
                         "{} (auto-split)",
-                        PackageFileName::deb(
-                            &plan.name,
-                            &plan.version,
-                            &plan.release,
-                            &plan.arch,
-                        ),
+                        PackageFileName::deb(&plan.name, &plan.version, &plan.release, &plan.arch,),
                     );
                     let progress = if quiet {
                         None
@@ -622,23 +617,17 @@ fn cmd_build(
                         let pkg_start = Instant::now();
 
                         // For meta-packages, compute Depends on all parts.
-                        let extra_depends: Vec<String> =
-                            if sub_pkg.role == SubPackageRole::Meta {
-                                plan.sub_packages
-                                    .iter()
-                                    .filter(|sp| {
-                                        matches!(sp.role, SubPackageRole::Part(_))
-                                    })
-                                    .map(|sp| {
-                                        format!(
-                                            "{} (= {}-{})",
-                                            sp.name, plan.version, plan.release
-                                        )
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
+                        let extra_depends: Vec<String> = if sub_pkg.role == SubPackageRole::Meta {
+                            plan.sub_packages
+                                .iter()
+                                .filter(|sp| matches!(sp.role, SubPackageRole::Part(_)))
+                                .map(|sp| {
+                                    format!("{} (= {}-{})", sp.name, plan.version, plan.release)
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
 
                         spm_deb::builder::build_single_deb(
                             sub_pkg,
@@ -646,9 +635,7 @@ fn cmd_build(
                             &config,
                             &output_path,
                             &extra_depends,
-                            progress
-                                .as_ref()
-                                .map(|p| p as &dyn BuildProgress),
+                            progress.as_ref().map(|p| p as &dyn BuildProgress),
                         )
                         .with_context(|| {
                             format!(
@@ -788,11 +775,8 @@ impl IndicatifProgress {
 
     /// Finish this package's progress display with a checkmark.
     fn finish(&self, compressed_size: u64, duration: Duration) {
-        self.overall.set_style(
-            ProgressStyle::default_spinner()
-                .template("{msg}")
-                .unwrap(),
-        );
+        self.overall
+            .set_style(ProgressStyle::default_spinner().template("{msg}").unwrap());
         self.overall.finish_with_message(format!(
             "  {} ({}, {:.1}s)",
             self.filename,

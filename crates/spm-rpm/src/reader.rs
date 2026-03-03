@@ -193,8 +193,7 @@ fn parse_header_section<R: Read>(reader: &mut R) -> Result<Vec<(u32, ParsedTagVa
         let base = i * 16;
         let tag = u32::from_be_bytes(index_buf[base..base + 4].try_into().unwrap());
         let tag_type = u32::from_be_bytes(index_buf[base + 4..base + 8].try_into().unwrap());
-        let offset_i32 =
-            i32::from_be_bytes(index_buf[base + 8..base + 12].try_into().unwrap());
+        let offset_i32 = i32::from_be_bytes(index_buf[base + 8..base + 12].try_into().unwrap());
         let count =
             u32::from_be_bytes(index_buf[base + 12..base + 16].try_into().unwrap()) as usize;
 

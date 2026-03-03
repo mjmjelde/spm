@@ -19,7 +19,10 @@ fn validate_install_path(path: &str, context: &str) -> Result<(), FileTreeError>
             reason: format!("{context} must be an absolute path (starting with '/')"),
         });
     }
-    if Path::new(path).components().any(|c| c == std::path::Component::ParentDir) {
+    if Path::new(path)
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(FileTreeError::InvalidMapping {
             src: String::new(),
             dst: path.to_string(),
@@ -441,12 +444,10 @@ fn glob_base_path(pattern: &str) -> PathBuf {
 fn parse_mode(mode_str: &str) -> Result<u32, FileTreeError> {
     let stripped = mode_str.trim_start_matches('0');
     let s = if stripped.is_empty() { "0" } else { stripped };
-    u32::from_str_radix(s, 8).map_err(|_| {
-        FileTreeError::InvalidMapping {
-            src: String::new(),
-            dst: String::new(),
-            reason: format!("invalid mode '{mode_str}': expected octal like '0755'"),
-        }
+    u32::from_str_radix(s, 8).map_err(|_| FileTreeError::InvalidMapping {
+        src: String::new(),
+        dst: String::new(),
+        reason: format!("invalid mode '{mode_str}': expected octal like '0755'"),
     })
 }
 
@@ -542,15 +543,14 @@ mod tests {
         fs::write(base.join("bin/world"), "#!/bin/bash\necho world").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/**", base.display()),
-                dst: "/opt/testpkg/".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/**", base.display()),
+            dst: "/opt/testpkg/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
 
@@ -588,15 +588,14 @@ mod tests {
 
         // Use a bare directory path (no **) — should auto-expand.
         let content = test_content(vec![FileMapping {
-                src: format!("{}", base.display()),
-                dst: "/opt/testpkg/".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}", base.display()),
+            dst: "/opt/testpkg/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
 
@@ -621,15 +620,14 @@ mod tests {
         fs::write(base.join("script.sh"), "#!/bin/bash").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/script.sh", base.display()),
-                dst: "/usr/bin/script.sh".to_string(),
-                mode: Some("0755".to_string()),
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/script.sh", base.display()),
+            dst: "/usr/bin/script.sh".to_string(),
+            mode: Some("0755".to_string()),
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
         let file_entry = entries
@@ -646,15 +644,14 @@ mod tests {
         fs::write(base.join("app.conf"), "setting=value").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/app.conf", base.display()),
-                dst: "/etc/app.conf".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: Some("config".to_string()),
-            }],
-        );
+            src: format!("{}/app.conf", base.display()),
+            dst: "/etc/app.conf".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: Some("config".to_string()),
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
         let file_entry = entries
@@ -750,15 +747,14 @@ mod tests {
         fs::write(base.join("b.txt"), "b").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/**", base.display()),
-                dst: "/opt/pkg/".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/**", base.display()),
+            dst: "/opt/pkg/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries1 = FileTree::walk(&content).unwrap();
         let entries2 = FileTree::walk(&content).unwrap();
@@ -780,15 +776,14 @@ mod tests {
         fs::write(base.join("tool"), "binary").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/tool", base.display()),
-                dst: "/opt/app/bin/tool".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/tool", base.display()),
+            dst: "/opt/app/bin/tool".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
         let dir_paths: HashSet<PathBuf> = entries
@@ -809,15 +804,14 @@ mod tests {
         fs::write(base.join("file"), "data").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/file", base.display()),
-                dst: "/opt/app/file".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: Some("appuser".to_string()),
-                group: Some("appgroup".to_string()),
-                r#type: None,
-            }],
-        );
+            src: format!("{}/file", base.display()),
+            dst: "/opt/app/file".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: Some("appuser".to_string()),
+            group: Some("appgroup".to_string()),
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
         let file = entries
@@ -839,15 +833,14 @@ mod tests {
         fs::hard_link(&file_a, &file_b).unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/*", base.display()),
-                dst: "/opt/pkg/".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/*", base.display()),
+            dst: "/opt/pkg/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
         let file_entries: Vec<_> = entries
@@ -910,7 +903,8 @@ mod tests {
             file_mode: None,
             dir_mode: None,
         };
-        let content = test_content_with_defaults(vec![FileMapping {
+        let content = test_content_with_defaults(
+            vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/app/".to_string(),
                 mode: None,
@@ -948,7 +942,8 @@ mod tests {
             file_mode: None,
             dir_mode: None,
         };
-        let content = test_content_with_defaults(vec![
+        let content = test_content_with_defaults(
+            vec![
                 FileMapping {
                     src: format!("{}/file_a", base.display()),
                     dst: "/opt/app/file_a".to_string(),
@@ -999,7 +994,8 @@ mod tests {
             file_mode: Some("0644".to_string()),
             dir_mode: Some("0755".to_string()),
         };
-        let content = test_content_with_defaults(vec![FileMapping {
+        let content = test_content_with_defaults(
+            vec![FileMapping {
                 src: format!("{}/**", base.display()),
                 dst: "/opt/app/".to_string(),
                 mode: None,
@@ -1040,15 +1036,14 @@ mod tests {
         fs::write(base.join("bin/tool"), "binary").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/**", base.display()),
-                dst: "/opt/app/".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/**", base.display()),
+            dst: "/opt/app/".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
 
@@ -1067,15 +1062,14 @@ mod tests {
         fs::write(base.join("license.txt"), "MIT License").unwrap();
 
         let content = test_content(vec![FileMapping {
-                src: format!("{}/license.txt", base.display()),
-                dst: "/opt/app/LICENSE".to_string(),
-                mode: None,
-                dir_mode: None,
-                user: None,
-                group: None,
-                r#type: None,
-            }],
-        );
+            src: format!("{}/license.txt", base.display()),
+            dst: "/opt/app/LICENSE".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
 
         let entries = FileTree::walk(&content).unwrap();
 

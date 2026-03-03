@@ -151,10 +151,8 @@ impl Planner {
                         }]
                     } else {
                         // Unlimited format (RPM): use estimation-based split.
-                        let safe_limit =
-                            limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
-                        let num_parts =
-                            (estimated_compressed as f64 / safe_limit).ceil() as u64;
+                        let safe_limit = limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
+                        let num_parts = (estimated_compressed as f64 / safe_limit).ceil() as u64;
                         let max_uncompressed_per_part = total_size / num_parts;
                         let mut parts = split_by_size(files, max_uncompressed_per_part, pkg_name);
                         fixup_hardlinks_across_parts(&mut parts);
@@ -162,7 +160,10 @@ impl Planner {
                     }
                 }
                 "size" => {
-                    let max_size_str = config.splitting.max_size.as_deref()
+                    let max_size_str = config
+                        .splitting
+                        .max_size
+                        .as_deref()
                         .expect("max_size required for size strategy (validated by config)");
                     let max_size =
                         parse_size(max_size_str).map_err(|reason| PlanError::InvalidSize {
@@ -218,12 +219,7 @@ impl Planner {
             .iter()
             .any(|sp| sp.role == SubPackageRole::Meta);
 
-        let warnings = build_warnings(
-            is_split,
-            deferred_split,
-            estimated_compressed,
-            limits,
-        );
+        let warnings = build_warnings(is_split, deferred_split, estimated_compressed, limits);
 
         Ok(PackagePlan {
             name: pkg_name.clone(),
@@ -297,10 +293,8 @@ impl Planner {
                         }]
                     } else {
                         // Unlimited format (RPM): use estimation-based split.
-                        let safe_limit =
-                            limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
-                        let num_parts =
-                            (estimated_compressed as f64 / safe_limit).ceil() as u64;
+                        let safe_limit = limits.max_compressed_payload as f64 * AUTO_SPLIT_HEADROOM;
+                        let num_parts = (estimated_compressed as f64 / safe_limit).ceil() as u64;
                         let max_uncompressed_per_part = total_size / num_parts;
                         let mut parts = split_by_size(files, max_uncompressed_per_part, pkg_name);
                         fixup_hardlinks_across_parts(&mut parts);
@@ -308,7 +302,10 @@ impl Planner {
                     }
                 }
                 "size" => {
-                    let max_size_str = config.splitting.max_size.as_deref()
+                    let max_size_str = config
+                        .splitting
+                        .max_size
+                        .as_deref()
                         .expect("max_size required for size strategy (validated by config)");
                     let max_size =
                         parse_size(max_size_str).map_err(|reason| PlanError::InvalidSize {
@@ -360,12 +357,7 @@ impl Planner {
             .iter()
             .any(|sp| sp.role == SubPackageRole::Meta);
 
-        let warnings = build_warnings(
-            is_split,
-            deferred_split,
-            estimated_compressed,
-            limits,
-        );
+        let warnings = build_warnings(is_split, deferred_split, estimated_compressed, limits);
 
         Ok(PackagePlan {
             name: pkg_name.clone(),
@@ -596,10 +588,7 @@ impl HardlinkFamilies {
 
         for (i, entry) in files.iter().enumerate() {
             if let EntryType::Hardlink { ref target } = entry.entry_type {
-                target_to_links
-                    .entry(target.clone())
-                    .or_default()
-                    .push(i);
+                target_to_links.entry(target.clone()).or_default().push(i);
                 link_indices.insert(i);
             }
         }
@@ -815,8 +804,15 @@ mod tests {
             .unwrap();
 
         // DEB auto-split now defers to the builder for monitored streaming split.
-        assert!(plan.deferred_split, "DEB over-limit should set deferred_split");
-        assert_eq!(plan.sub_packages.len(), 1, "deferred split produces single SubPackage");
+        assert!(
+            plan.deferred_split,
+            "DEB over-limit should set deferred_split"
+        );
+        assert_eq!(
+            plan.sub_packages.len(),
+            1,
+            "deferred split produces single SubPackage"
+        );
         assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
         assert!(!plan.sub_packages[0].files.is_empty());
     }
@@ -1043,7 +1039,10 @@ mod tests {
             .unwrap();
 
         // DEB borderline now defers to the builder.
-        assert!(plan.deferred_split, "expected deferred_split for borderline DEB");
+        assert!(
+            plan.deferred_split,
+            "expected deferred_split for borderline DEB"
+        );
         assert_eq!(plan.sub_packages.len(), 1);
         assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
     }
@@ -1087,7 +1086,9 @@ mod tests {
 
         assert!(!plan.is_split, "should not split at 63%");
         assert!(
-            plan.warnings.iter().any(|w| w.contains("consider enabling splitting")),
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("consider enabling splitting")),
             "expected near-limit warning, got: {:?}",
             plan.warnings
         );
@@ -1105,7 +1106,10 @@ mod tests {
             .unwrap();
 
         assert!(!plan.is_split);
-        assert!(plan.warnings.is_empty(), "expected no warnings for small package");
+        assert!(
+            plan.warnings.is_empty(),
+            "expected no warnings for small package"
+        );
     }
 
     #[test]
@@ -1503,9 +1507,7 @@ mod tests {
             .map(|e| e.install_path.as_path())
             .collect();
         assert!(
-            last_non_dirs
-                .iter()
-                .any(|p| p.ends_with("tiny.txt")),
+            last_non_dirs.iter().any(|p| p.ends_with("tiny.txt")),
             "tiny file should be in the last (merged) part"
         );
     }
@@ -1595,15 +1597,13 @@ mod tests {
             test_file("/opt/matlab/tiny_leftover.txt", 495),
         ];
 
-        let plan = Planner::plan_from_entries(
-            &config,
-            &limits,
-            files,
-            ResolvedScripts::default(),
-        )
-        .unwrap();
+        let plan = Planner::plan_from_entries(&config, &limits, files, ResolvedScripts::default())
+            .unwrap();
 
-        assert!(plan.deferred_split, "DEB auto-split should defer to builder");
+        assert!(
+            plan.deferred_split,
+            "DEB auto-split should defer to builder"
+        );
         assert_eq!(plan.sub_packages.len(), 1);
         assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
 
@@ -1662,9 +1662,7 @@ mod tests {
         assert!(families.is_link(1)); // link1 is a link
         assert!(families.is_link(2)); // link2 is a link
 
-        let links = families
-            .links_for_target(Path::new("/opt/target"))
-            .unwrap();
+        let links = families.links_for_target(Path::new("/opt/target")).unwrap();
         assert_eq!(links, &[1, 2]);
     }
 
@@ -1689,10 +1687,20 @@ mod tests {
         let scripts = ResolvedScripts::default();
 
         let plan = Planner::plan_from_entries(&config, &limits, files, scripts).unwrap();
-        assert!(plan.deferred_split, "DEB auto-split should set deferred_split");
-        assert_eq!(plan.sub_packages.len(), 1, "should produce single SubPackage");
+        assert!(
+            plan.deferred_split,
+            "DEB auto-split should set deferred_split"
+        );
+        assert_eq!(
+            plan.sub_packages.len(),
+            1,
+            "should produce single SubPackage"
+        );
         assert_eq!(plan.sub_packages[0].role, SubPackageRole::Standalone);
-        assert!(!plan.is_split, "is_split should be false (no Meta subpackage)");
+        assert!(
+            !plan.is_split,
+            "is_split should be false (no Meta subpackage)"
+        );
     }
 
     #[test]
