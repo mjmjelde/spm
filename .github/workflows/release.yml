@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          SPM_VERSION="${VERSION%%-*}"
+          PRERELEASE="${VERSION#${SPM_VERSION}}"
+          if [ -n "$PRERELEASE" ]; then
+            SPM_RELEASE="0.${PRERELEASE#-}"
+          else
+            SPM_RELEASE="1"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "spm_version=$SPM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "spm_release=$SPM_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Build packages with spm
+        env:
+          SPM_VERSION: ${{ steps.version.outputs.spm_version }}
+          SPM_RELEASE: ${{ steps.version.outputs.spm_release }}
+          SPM_BINARY: ${{ github.workspace }}/target/release/spm
+          SOURCE_DATE_EPOCH: ${{ steps.version.outputs.source_date_epoch }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          mkdir -p dist
+          ./target/release/spm build \
+            --config packaging/spm.yaml \
+            --format all \
+            --output dist
+
+      - name: Verify packages
+        run: |
+          echo "=== Built packages ==="
+          ls -lh dist/
+
+          echo ""
+          echo "=== RPM inspection ==="
+          for f in dist/*.rpm; do
+            ./target/release/spm inspect "$f"
+          done
+
+          echo ""
+          echo "=== DEB inspection ==="
+          for f in dist/*.deb; do
+            ./target/release/spm inspect "$f"
+          done
+
+      - name: Prepare release assets
+        run: |
+          cp target/release/spm "dist/spm-${{ steps.version.outputs.version }}-x86_64-linux"
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: spm ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.rpm
+            dist/*.deb
+            dist/spm-*-x86_64-linux
+            dist/SHA256SUMS

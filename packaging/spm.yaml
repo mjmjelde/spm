@@ -1,0 +1,36 @@
+package:
+  name: spm
+  version: "${SPM_VERSION}"
+  release: "${SPM_RELEASE}"
+  arch: x86_64
+  license: MIT
+  maintainer: "Matthew Mjelde <mjmjelde@gmail.com>"
+  description: "Large-file-aware Linux package builder for RPM and DEB"
+  url: "https://github.com/mjmjelde/spm"
+
+content:
+  defaults:
+    user: root
+    group: root
+    file_mode: "0644"
+    dir_mode: "0755"
+
+  files:
+    - src: "${SPM_BINARY}"
+      dst: /usr/bin/spm
+      mode: "0755"
+
+compression:
+  algorithm: zstd
+  level: 3
+  threads: 0
+
+splitting:
+  enabled: false
+
+rpm:
+  group: Development/Tools
+
+deb:
+  section: utils
+  priority: optional
