@@ -129,9 +129,14 @@ spm-cpio      (standalone, only depends on thiserror)
 
 ### spm-deb
 
-- `DebBuilder::build()` — Full DEB build pipeline: control file → control.tar → data.tar → ar assembly. Handles split packages.
+- `DebBuilder::build()` — Full DEB build pipeline: data.tar (with inline MD5 hashing) → control.tar → ar assembly. Handles split packages. Deferred split monitors actual compressed size via `CountingWriter` and splits at 95% of the ar member limit.
+- `build_streaming_split()` — Monitored streaming split path for deferred-split DEB packages. Streams files through tar → compressor → `CountingWriter` → temp file, collecting MD5 hashes inline.
+- `HashingReader<R: Read>` — Wrapper that computes MD5 digests as data flows through to the tar builder, eliminating a separate file-reading pass for md5sums.
+- `CountingWriter<W: Write>` — Wrapper that tracks compressed bytes written via `AtomicU64` for real-time split threshold monitoring without flushing the compressor.
 - `ArWriter<W: Write>` — ar archive writer with reproducible timestamps and member size validation (rejects > 9,999,999,999 bytes).
 - `generate_control()` — Creates RFC 822 control file content.
+- `generate_md5sums()` — Computes MD5 by reading source files (fallback path).
+- `generate_md5sums_precomputed()` — Formats pre-computed MD5 hashes from the data tar write pass (primary path, no file I/O).
 - `read_deb_metadata()` — Reads and parses an existing DEB file, returning `DebMetadata` with all control fields.
 - `DebMetadata` — Extracted metadata: ordered `fields: Vec<(String, String)>` with case-insensitive `get()`.
 - `DebError` — `Io`, `Tar`, `Compress`, `SourceFile`, `InvalidDeb`.

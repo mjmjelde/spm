@@ -1146,6 +1146,9 @@ impl<W: std::io::Write> ArWriter<W> {
    - Use GNU tar format (for large file support)
    - Compress with configured algorithm
    - **Stream the data**: tar → compress → temp file (need to know final size for ar header)
+   - MD5 hashes computed inline during tar write via `HashingReader` wrapper — avoids a second
+     read pass for md5sums generation (critical for large packages where the compression pass
+     evicts source files from page cache)
 5. Assemble the DEB: `debian-binary` + `control.tar.zst` + `data.tar.zst` into ar archive
 6. Implement auto-split DEB flow:
    - When `plan.is_split == true`, build each `SubPackage` as a separate DEB
@@ -1153,7 +1156,12 @@ impl<W: std::io::Write> ArWriter<W> {
    - Each part DEB has its subset of files
    - ar writer validates member sizes at write time (rejects > 9,999,999,999 bytes)
    - Even-parts sizing ensures each part stays well under the ar limit
+   - Deferred split (streaming split): monitors actual compressed size via `CountingWriter` +
+     `AtomicU64` counter, splitting when 95% of the ar member limit is reached
 7. Implement md5sums generation for all files
+   - `generate_md5sums()`: reads source files and computes MD5 (fallback path)
+   - `generate_md5sums_precomputed()`: formats pre-computed hashes from the data tar write pass
+     (primary path — eliminates cold-cache re-read penalty for large packages)
 8. Wire alternatives auto-dependency injection for DEB (no extra package needed — `update-alternatives` ships with dpkg)
 
 ### Acceptance Criteria

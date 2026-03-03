@@ -184,6 +184,54 @@ Focused audit of the package splitting subsystem across planner, builders, and c
   integrity, directory-based split ancestor directory injection, empty part filtering, 3 config
   validation tests
 
+### DEB Streaming Split & Performance
+
+- Implemented monitored streaming split for DEB auto-split (`build_streaming_split`):
+  streams all files through tar → compressor → `CountingWriter` → temp file, splitting when
+  actual compressed output reaches 95% of the ar member limit. Replaces the old estimated
+  compression ratio approach with exact compressed-size monitoring via `AtomicU64` counter.
+- Added `HashingReader<R>` wrapper that computes MD5 hashes inline during the tar write pass,
+  eliminating a second full read of all source files for `md5sums` generation. For the 24.3 GiB
+  MATLAB package (628K files), this saves ~400s that was previously spent re-reading files from
+  cold page cache after streaming compression evicted them.
+- Added `generate_md5sums_precomputed()` in `control.rs` — formats pre-computed hashes without
+  any file I/O, used when `md5_map` is available from the data tar write pass.
+- `write_tar_entry()` now returns `Option<String>` (MD5 hex digest for regular files) and
+  `write_data_tar()` returns a `HashMap<PathBuf, String>` of pre-computed hashes alongside the
+  temp file and size.
+- `write_control_tar()` accepts optional `md5_map` parameter — when provided, uses pre-computed
+  hashes; falls back to `generate_md5sums()` (file-reading) when `None`.
+
+### Deep Analysis Round 3: Correctness, Security, and Compliance Fixes
+
+Comprehensive audit across all 6 crates; 20 fixes applied across 8 files.
+
+**Critical:**
+- Fixed RPM header region tag index sort — region tags (62/63) now sorted after data tags to
+  maintain monotonically non-decreasing offset order required by `hdrblobVerifyInfo()`
+
+**High:**
+- Fixed zstd `finish()` — changed from `AutoFinishEncoder` (which silently discards errors on
+  drop) to raw `Encoder` with explicit `finish()` for proper error propagation
+- Added bounds check for `sub_packages[0]` access in `build_streaming_split`
+- Handle empty `parts` in `build_streaming_split` — all-directory packages now produce a valid
+  single .deb instead of a broken empty meta-package
+- Added bounds checks to RPM `skip_header_section` (matching `parse_header_section` limits)
+
+**Medium:**
+- Moved DEB extra fields before Description (Debian policy §5.6.13 compliance)
+- DEB `write_tar_entry` now uses `entry.user`/`entry.group` instead of hardcoded "root"
+- DEB reader uses streaming `BufReader` with `Seek` instead of loading entire file into memory
+- RPM reader parses index offset as `i32` (region tags have negative offsets per spec)
+- Added path traversal validation — `dst` fields must be absolute with no `..` components
+- Added duplicate tag detection in RPM `HeaderBuilder`
+- Fixed `build_warnings` for deferred-split case (no longer warns "consider splitting" when
+  splitting is already active)
+- RPM `parse_dependency` now handles `==` operator (was silently treating as "any version")
+- Compression level validation per algorithm (negative levels no longer wrap to huge `u32`)
+- RPM builder uses `symlink_metadata` for symlink mtime (was following symlinks)
+- Special files (devices, sockets, pipes) in glob results now emit warnings
+
 ### Phase 5b: CLI Integration — Build Flags, Inspect, Spinners
 
 - Added `decompress_reader()` to `spm-compress` for unified decompression (Zstd, Gzip, Xz, None)
