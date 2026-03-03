@@ -3,8 +3,9 @@
 //! Generates the `control`, `conffiles`, and `md5sums` files
 //! that go inside `control.tar.{zst,gz}`.
 
+use std::collections::HashMap;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 
@@ -93,7 +94,18 @@ pub fn generate_control(
         lines.push(format!("Homepage: {url}"));
     }
 
+    // Extra fields from deb.fields — inserted before Description per
+    // Debian policy §5.6.13 (Description must be the last field).
+    if let Some(deb) = &config.deb {
+        let mut fields: Vec<_> = deb.fields.iter().collect();
+        fields.sort_by_key(|(k, _)| *k);
+        for (key, value) in fields {
+            lines.push(format!("{key}: {value}"));
+        }
+    }
+
     // Description (multi-line formatted per Debian policy §5.6.13).
+    // Must be the last field since its body uses continuation lines.
     let desc = &config.package.description;
     let desc_lines: Vec<&str> = desc.lines().collect();
     if let Some(first_line) = desc_lines.first() {
@@ -107,15 +119,6 @@ pub fn generate_control(
         }
     } else {
         lines.push("Description: ".to_string());
-    }
-
-    // Extra fields from deb.fields.
-    if let Some(deb) = &config.deb {
-        let mut fields: Vec<_> = deb.fields.iter().collect();
-        fields.sort_by_key(|(k, _)| *k);
-        for (key, value) in fields {
-            lines.push(format!("{key}: {value}"));
-        }
     }
 
     lines.join("\n") + "\n"
@@ -182,6 +185,31 @@ fn md5_file(path: &Path) -> Result<String, DebError> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Format pre-computed MD5 hashes into the md5sums file content.
+///
+/// Same output format as `generate_md5sums` but uses hashes already computed
+/// during the tar write pass, avoiding a second read of every source file.
+pub fn generate_md5sums_precomputed(
+    files: &[FileEntry],
+    md5_map: &HashMap<PathBuf, String>,
+) -> String {
+    let mut lines = Vec::new();
+    for entry in files {
+        if !matches!(entry.entry_type, EntryType::RegularFile) {
+            continue;
+        }
+        if let Some(md5_hex) = md5_map.get(&entry.install_path) {
+            let path = entry.install_path.to_string_lossy();
+            let rel_path = path.strip_prefix('/').unwrap_or(&path);
+            lines.push(format!("{md5_hex}  {rel_path}"));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.join("\n") + "\n"
 }
 
 #[cfg(test)]

@@ -132,8 +132,22 @@ fn skip_header_section<R: Read + Seek>(reader: &mut R) -> Result<u64, RpmError> 
 
     let index_count = u32::from_be_bytes(preamble[8..12].try_into().unwrap()) as u64;
     let data_size = u32::from_be_bytes(preamble[12..16].try_into().unwrap()) as u64;
-    let skip_bytes = index_count * 16 + data_size;
 
+    // Same bounds as parse_header_section to reject malformed/malicious RPMs.
+    const MAX_INDEX_COUNT: u64 = 100_000;
+    const MAX_DATA_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+    if index_count > MAX_INDEX_COUNT {
+        return Err(RpmError::InvalidRpm(format!(
+            "header index_count {index_count} exceeds maximum {MAX_INDEX_COUNT}"
+        )));
+    }
+    if data_size > MAX_DATA_SIZE {
+        return Err(RpmError::InvalidRpm(format!(
+            "header data_size {data_size} exceeds maximum {MAX_DATA_SIZE}"
+        )));
+    }
+
+    let skip_bytes = index_count * 16 + data_size;
     reader.seek(SeekFrom::Current(skip_bytes as i64))?;
 
     Ok(skip_bytes)
@@ -179,10 +193,17 @@ fn parse_header_section<R: Read>(reader: &mut R) -> Result<Vec<(u32, ParsedTagVa
         let base = i * 16;
         let tag = u32::from_be_bytes(index_buf[base..base + 4].try_into().unwrap());
         let tag_type = u32::from_be_bytes(index_buf[base + 4..base + 8].try_into().unwrap());
-        let offset =
-            u32::from_be_bytes(index_buf[base + 8..base + 12].try_into().unwrap()) as usize;
+        let offset_i32 =
+            i32::from_be_bytes(index_buf[base + 8..base + 12].try_into().unwrap());
         let count =
             u32::from_be_bytes(index_buf[base + 12..base + 16].try_into().unwrap()) as usize;
+
+        // Region tag entries (62, 63) have negative offsets — skip them since
+        // they are format metadata, not package data we need to extract.
+        if offset_i32 < 0 {
+            continue;
+        }
+        let offset = offset_i32 as usize;
 
         if let Some(value) = extract_tag_value(tag_type, offset, count, &data) {
             tags.push((tag, value));

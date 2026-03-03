@@ -10,6 +10,25 @@ use std::path::{Path, PathBuf};
 use crate::config::{ContentConfig, ContentDefaults};
 use crate::error::FileTreeError;
 
+/// Validate that an install path is absolute and contains no `..` components.
+fn validate_install_path(path: &str, context: &str) -> Result<(), FileTreeError> {
+    if !path.starts_with('/') {
+        return Err(FileTreeError::InvalidMapping {
+            src: String::new(),
+            dst: path.to_string(),
+            reason: format!("{context} must be an absolute path (starting with '/')"),
+        });
+    }
+    if Path::new(path).components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(FileTreeError::InvalidMapping {
+            src: String::new(),
+            dst: path.to_string(),
+            reason: format!("{context} must not contain '..' components"),
+        });
+    }
+    Ok(())
+}
+
 /// A single file, directory, or symlink to include in the package.
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -75,6 +94,14 @@ impl FileTree {
                     reason: "symlink target must not be empty".into(),
                 });
             }
+            if sym.dst.is_empty() {
+                return Err(FileTreeError::InvalidMapping {
+                    src: sym.src.clone(),
+                    dst: sym.dst.clone(),
+                    reason: "symlink install path must not be empty".into(),
+                });
+            }
+            validate_install_path(&sym.dst, "symlink dst")?;
             let install_path = PathBuf::from(&sym.dst);
             if seen_install_paths.insert(install_path.clone()) {
                 entries.push(FileEntry {
@@ -94,6 +121,7 @@ impl FileTree {
 
         // Process directories from config.
         for dir in &content.directories {
+            validate_install_path(&dir.path, "directory path")?;
             let install_path = PathBuf::from(&dir.path);
             if seen_install_paths.insert(install_path.clone()) {
                 let mode = dir
@@ -138,6 +166,8 @@ fn process_file_mapping(
 ) -> Result<Vec<FileEntry>, FileTreeError> {
     let src_pattern = &mapping.src;
     let dst = &mapping.dst;
+
+    validate_install_path(dst.trim_end_matches('/'), "file mapping dst")?;
 
     // Determine if src is a glob pattern or a plain path.
     let is_glob =
@@ -324,6 +354,14 @@ fn process_file_mapping(
                 user: resolved_user,
                 group: resolved_group,
                 is_config,
+            });
+        } else {
+            // Special file (block/char device, FIFO, socket) — reject with
+            // a clear error instead of silently skipping.
+            return Err(FileTreeError::InvalidMapping {
+                src: source_path.to_string_lossy().into_owned(),
+                dst: install_path.to_string_lossy().into_owned(),
+                reason: "special files (devices, FIFOs, sockets) are not supported".into(),
             });
         }
     }

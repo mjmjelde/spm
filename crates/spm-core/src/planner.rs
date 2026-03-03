@@ -220,6 +220,7 @@ impl Planner {
 
         let warnings = build_warnings(
             is_split,
+            deferred_split,
             estimated_compressed,
             limits,
         );
@@ -361,6 +362,7 @@ impl Planner {
 
         let warnings = build_warnings(
             is_split,
+            deferred_split,
             estimated_compressed,
             limits,
         );
@@ -383,6 +385,7 @@ impl Planner {
 /// Build warnings about packages that are close to format limits.
 fn build_warnings(
     is_split: bool,
+    deferred_split: bool,
     estimated_compressed: u64,
     limits: &FormatLimits,
 ) -> Vec<String> {
@@ -404,8 +407,8 @@ fn build_warnings(
             limits.format_name,
             format_size(limits.max_compressed_payload),
         ));
-    } else if !is_split && pct > 60.0 {
-        // Not split, but getting close to the limit.
+    } else if !is_split && !deferred_split && pct > 60.0 {
+        // Not split (and not deferred), but getting close to the limit.
         warnings.push(format!(
             "estimated compressed size ({}) is {pct:.0}% of the {} format limit ({}); \
              consider enabling splitting for safety",

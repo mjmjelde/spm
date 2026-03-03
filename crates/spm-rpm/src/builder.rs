@@ -133,7 +133,8 @@ impl RpmBuilder {
         // Pad to 8-byte boundary after signature header.
         let sig_pad = (8 - (sig_bytes.len() % 8)) % 8;
         if sig_pad > 0 {
-            output.write_all(&vec![0u8; sig_pad])?;
+            const ZEROS: [u8; 8] = [0; 8];
+            output.write_all(&ZEROS[..sig_pad])?;
         }
 
         // Metadata header.
@@ -287,7 +288,18 @@ fn add_file_metadata(
         let sizes: Vec<i64> = files.iter().map(|f| f.size as i64).collect();
         hdr.add_int64(RPMTAG_LONGFILESIZES, sizes);
     } else {
-        let sizes: Vec<i32> = files.iter().map(|f| f.size as i32).collect();
+        let mut sizes = Vec::with_capacity(files.len());
+        for f in files {
+            if f.size > i32::MAX as u64 {
+                return Err(RpmError::Header(format!(
+                    "file '{}' is {} bytes, exceeding the 2 GiB FILESIZES tag limit; \
+                     use extended CPIO format for packages with files > 2 GiB",
+                    f.install_path.display(),
+                    f.size,
+                )));
+            }
+            sizes.push(f.size as i32);
+        }
         hdr.add_int32(RPMTAG_FILESIZES, sizes);
     }
 
@@ -306,7 +318,7 @@ fn add_file_metadata(
     let mtimes: Vec<i32> = files
         .iter()
         .map(|f| {
-            if let Ok(meta) = std::fs::metadata(&f.source_path) {
+            if let Ok(meta) = std::fs::symlink_metadata(&f.source_path) {
                 meta.modified()
                     .ok()
                     .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -582,7 +594,7 @@ fn parse_dependency(dep: &str) -> (String, String, i32) {
             "<=" => (RPMSENSE_LESS | RPMSENSE_EQUAL) as i32,
             ">" => RPMSENSE_GREATER as i32,
             "<" => RPMSENSE_LESS as i32,
-            "=" => RPMSENSE_EQUAL as i32,
+            "=" | "==" => RPMSENSE_EQUAL as i32,
             _ => RPMSENSE_ANY as i32,
         };
 
@@ -1261,5 +1273,49 @@ mod tests {
         let data_str = String::from_utf8_lossy(&bytes);
         assert!(!data_str.contains("/usr/sbin/alternatives"));
         assert!(!data_str.contains("chkconfig"));
+    }
+
+    #[test]
+    fn test_file_size_i32_overflow_rejected() {
+        let big_file = FileEntry {
+            install_path: PathBuf::from("/opt/app/bigfile.bin"),
+            source_path: PathBuf::new(),
+            entry_type: EntryType::RegularFile,
+            size: i32::MAX as u64 + 1, // 2 GiB + 1 byte
+            mode: 0o644,
+            user: "root".into(),
+            group: "root".into(),
+            is_config: false,
+        };
+
+        let mut hdr = HeaderBuilder::new();
+        let inode_map = build_inode_map(&[big_file.clone()]);
+        let digests = vec!["d41d8cd98f00b204e9800998ecf8427e".to_owned()];
+
+        let result = add_file_metadata(&mut hdr, &[big_file], false, &digests, &inode_map);
+        assert!(result.is_err(), "should reject file > 2 GiB in non-extended mode");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("2 GiB"), "error should mention 2 GiB limit: {msg}");
+    }
+
+    #[test]
+    fn test_file_size_i64_accepted_in_extended_mode() {
+        let big_file = FileEntry {
+            install_path: PathBuf::from("/opt/app/bigfile.bin"),
+            source_path: PathBuf::new(),
+            entry_type: EntryType::RegularFile,
+            size: i32::MAX as u64 + 1, // 2 GiB + 1 byte
+            mode: 0o644,
+            user: "root".into(),
+            group: "root".into(),
+            is_config: false,
+        };
+
+        let mut hdr = HeaderBuilder::new();
+        let inode_map = build_inode_map(&[big_file.clone()]);
+        let digests = vec!["d41d8cd98f00b204e9800998ecf8427e".to_owned()];
+
+        let result = add_file_metadata(&mut hdr, &[big_file], true, &digests, &inode_map);
+        assert!(result.is_ok(), "extended mode should accept files > 2 GiB");
     }
 }

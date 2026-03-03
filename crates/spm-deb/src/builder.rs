@@ -4,10 +4,15 @@
 //! writing compressed data and control tars to temp files, and assembling
 //! the final ar archive.
 
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use md5::{Digest, Md5};
 
 use tar::{Builder as TarBuilder, EntryType as TarEntryType, Header as TarHeader};
 
@@ -95,7 +100,7 @@ pub fn build_single_deb(
     let file_count = sub_package.files.len() as u64;
     let total_bytes = sub_package.total_size;
     progress.stage_start(BuildStage::WritingPayload, file_count, total_bytes);
-    let (data_tmp, data_size) =
+    let (data_tmp, data_size, md5_map) =
         write_data_tar(&sub_package.files, &compressor_config, mtime, progress)?;
     progress.stage_finish(BuildStage::WritingPayload);
 
@@ -108,6 +113,7 @@ pub fn build_single_deb(
         extra_depends,
         &compressor_config,
         mtime,
+        Some(&md5_map),
     )?;
     progress.stage_finish(BuildStage::WritingControl);
 
@@ -151,6 +157,15 @@ struct StreamingPartResult {
     files: Vec<FileEntry>,
     /// Total uncompressed size of files in this part.
     total_size: u64,
+    /// Pre-computed MD5 hashes (install_path -> hex digest).
+    md5_map: HashMap<PathBuf, String>,
+}
+
+/// Shared build context passed through assembly functions.
+struct BuildContext<'a> {
+    compressor_config: &'a CompressorConfig,
+    compress_ext: &'a str,
+    mtime: u64,
 }
 
 /// Threshold factor for streaming split. The builder splits when the actual
@@ -159,20 +174,60 @@ struct StreamingPartResult {
 /// compressor buffering not yet flushed.
 const STREAMING_SPLIT_HEADROOM: f64 = 0.95;
 
-/// Only flush the compressor and check compressed size every this many
-/// uncompressed bytes. Flushing zstd forces a block boundary via
-/// ZSTD_flushStream, which is expensive at high compression levels and
-/// degrades both speed and compression ratio when called too frequently.
-/// 256 MiB gives ~90 MiB of compressed-size granularity at typical ratios,
-/// well within the 5% split headroom (~500 MiB).
-const FLUSH_INTERVAL: u64 = 256 * 1024 * 1024;
+/// A write wrapper that counts bytes written through it via a shared atomic
+/// counter. This lets us monitor compressed output size in real time without
+/// flushing the compressor (which forces expensive `ZSTD_flushStream` calls).
+struct CountingWriter<W> {
+    inner: W,
+    count: Arc<AtomicU64>,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A reader wrapper that computes an MD5 hash as data flows through.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Md5,
+}
+
+impl<R: Read> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Md5::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
 
 /// Build DEB packages using monitored streaming split.
 ///
 /// Instead of pre-splitting files by estimated compression ratios, this streams
-/// all files through tar → compressor → temp file, periodically checking the
-/// actual compressed output size. When the threshold is reached, the current
-/// part is finalized and a new one begins.
+/// all files through tar → compressor → CountingWriter → temp file, checking
+/// the compressed byte counter after each file. When the threshold is reached,
+/// the current part is finalized and a new one begins.
 pub fn build_streaming_split(
     plan: &PackagePlan,
     config: &Config,
@@ -191,10 +246,18 @@ pub fn build_streaming_split(
         _ => format!(".{}", algorithm.extension()),
     };
     let mtime = resolve_mtime(config);
+    let ctx = BuildContext {
+        compressor_config: &compressor_config,
+        compress_ext: &compress_ext,
+        mtime,
+    };
 
     // The single SubPackage containing all files.
-    let all_files = &plan.sub_packages[0].files;
-    let scripts = &plan.sub_packages[0].scripts;
+    let sub = plan.sub_packages.first().ok_or_else(|| {
+        DebError::Archive("deferred split requires at least one sub-package".into())
+    })?;
+    let all_files = &sub.files;
+    let scripts = &sub.scripts;
 
     let threshold =
         (FormatLimits::deb().max_compressed_payload as f64 * STREAMING_SPLIT_HEADROOM) as u64;
@@ -223,11 +286,18 @@ pub fn build_streaming_split(
     let mut parts: Vec<StreamingPartResult> = Vec::new();
     let mut current_files: Vec<FileEntry> = Vec::new();
     let mut current_size: u64 = 0;
-    let mut bytes_since_flush: u64 = 0;
+    let mut current_md5s: HashMap<PathBuf, String> = HashMap::new();
+
+    // Shared counter tracks compressed bytes written without flushing the
+    // compressor. This avoids expensive ZSTD_flushStream calls entirely.
+    let counter = Arc::new(AtomicU64::new(0));
 
     // Start first part.
     let mut data_tmp = tempfile::NamedTempFile::new()?;
-    let mut compressor = compress_writer(&compressor_config, &data_tmp)?;
+    let mut compressor = compress_writer(
+        &compressor_config,
+        CountingWriter { inner: &data_tmp, count: counter.clone() },
+    )?;
     let mut tar = TarBuilder::new(compressor);
 
     // Write all directory entries to the first part's tar.
@@ -242,70 +312,70 @@ pub fn build_streaming_split(
         }
 
         // Write this entry.
-        write_tar_entry(&mut tar, entry, mtime)?;
+        if let Some(hash) = write_tar_entry(&mut tar, entry, mtime)? {
+            current_md5s.insert(entry.install_path.clone(), hash);
+        }
         prog.item_completed(entry.size);
         included[i] = true;
         current_files.push(entry.clone());
         current_size += entry.size;
-        bytes_since_flush += entry.size;
 
         // If this file is a hardlink target, pull in all its links immediately.
         if let Some(link_indices) = families.links_for_target(&entry.install_path) {
             for &li in link_indices {
                 if !included[li] {
                     let link_entry = &all_files[li];
-                    write_tar_entry(&mut tar, link_entry, mtime)?;
+                    if let Some(hash) = write_tar_entry(&mut tar, link_entry, mtime)? {
+                        current_md5s.insert(link_entry.install_path.clone(), hash);
+                    }
                     prog.item_completed(link_entry.size);
                     included[li] = true;
                     current_files.push(link_entry.clone());
                     current_size += link_entry.size;
-                    bytes_since_flush += link_entry.size;
                 }
             }
         }
 
-        // Periodically flush compressor and check actual compressed size.
-        // We avoid flushing after every file because ZSTD_flushStream forces
-        // a block boundary, which is expensive at high compression levels and
-        // degrades both speed and compression ratio.
-        if bytes_since_flush >= FLUSH_INTERVAL {
-            tar.get_mut().flush()?;
-            let compressed_so_far = std::fs::metadata(data_tmp.path())?.len();
-            bytes_since_flush = 0;
+        // Check compressed size via the atomic counter — no flush needed.
+        // The counter tracks bytes the compressor has written through to the
+        // output file, lagging by at most one zstd block (~128 KB).
+        if counter.load(Ordering::Relaxed) >= threshold {
+            // Finalize this part.
+            compressor = tar
+                .into_inner()
+                .map_err(|e| DebError::Tar(e.to_string()))?;
+            compressor.finish()?;
+            let data_size = std::fs::metadata(data_tmp.path())?.len();
 
-            if compressed_so_far >= threshold {
-                // Finalize this part.
-                compressor = tar
-                    .into_inner()
-                    .map_err(|e| DebError::Tar(e.to_string()))?;
-                compressor.finish()?;
-                let data_size = std::fs::metadata(data_tmp.path())?.len();
+            parts.push(StreamingPartResult {
+                data_tmp,
+                data_size,
+                files: std::mem::take(&mut current_files),
+                total_size: current_size,
+                md5_map: std::mem::take(&mut current_md5s),
+            });
+            prog.part_completed(parts.len() as u32, data_size);
+            current_size = 0;
 
-                parts.push(StreamingPartResult {
-                    data_tmp,
-                    data_size,
-                    files: std::mem::take(&mut current_files),
-                    total_size: current_size,
-                });
-                prog.part_completed(parts.len() as u32, data_size);
-                current_size = 0;
-                bytes_since_flush = 0;
+            // Start next part with a fresh counter.
+            counter.store(0, Ordering::Relaxed);
+            data_tmp = tempfile::NamedTempFile::new()?;
+            compressor = compress_writer(
+                &compressor_config,
+                CountingWriter { inner: &data_tmp, count: counter.clone() },
+            )?;
+            tar = TarBuilder::new(compressor);
 
-                // Start next part.
-                data_tmp = tempfile::NamedTempFile::new()?;
-                compressor = compress_writer(&compressor_config, &data_tmp)?;
-                tar = TarBuilder::new(compressor);
-
-                // Write directory entries to new part's tar.
-                for dir in &dir_entries {
-                    write_tar_entry(&mut tar, dir, mtime)?;
-                }
+            // Write directory entries to new part's tar.
+            for dir in &dir_entries {
+                write_tar_entry(&mut tar, dir, mtime)?;
             }
         }
     }
 
-    // Finalize last part (always has content unless file list was empty).
-    if !current_files.is_empty() {
+    // Finalize last part.  Always produce at least one part so that
+    // all-directory packages (no regular files) still generate a valid .deb.
+    if !current_files.is_empty() || parts.is_empty() {
         compressor = tar
             .into_inner()
             .map_err(|e| DebError::Tar(e.to_string()))?;
@@ -317,6 +387,7 @@ pub fn build_streaming_split(
             data_size,
             files: std::mem::take(&mut current_files),
             total_size: current_size,
+            md5_map: std::mem::take(&mut current_md5s),
         });
     }
 
@@ -349,10 +420,8 @@ pub fn build_streaming_split(
             &[],
             part.data_tmp,
             part.data_size,
-            &compressor_config,
-            &compress_ext,
-            mtime,
-            prog,
+            &ctx,
+            &part.md5_map,
         )?;
         output_paths.push(output_path);
     } else {
@@ -403,10 +472,8 @@ pub fn build_streaming_split(
                 &[],
                 part.data_tmp,
                 part.data_size,
-                &compressor_config,
-                &compress_ext,
-                mtime,
-                prog,
+                &ctx,
+                &part.md5_map,
             )?;
             output_paths.push(output_path);
         }
@@ -419,6 +486,7 @@ pub fn build_streaming_split(
 ///
 /// Builds the control.tar, then assembles the final ar archive using the
 /// pre-built data.tar. This avoids re-compressing data during streaming split.
+#[allow(clippy::too_many_arguments)]
 fn assemble_deb_from_data_tar(
     sub_package: &SubPackage,
     plan: &PackagePlan,
@@ -427,64 +495,65 @@ fn assemble_deb_from_data_tar(
     extra_depends: &[String],
     data_tmp: tempfile::NamedTempFile,
     data_size: u64,
-    compressor_config: &CompressorConfig,
-    compress_ext: &str,
-    mtime: u64,
-    progress: &dyn BuildProgress,
+    ctx: &BuildContext<'_>,
+    md5_map: &HashMap<PathBuf, String>,
 ) -> Result<(), DebError> {
     // Build control.tar.
-    progress.stage_start(BuildStage::WritingControl, 0, 0);
     let (control_tmp, control_size) = write_control_tar(
         sub_package,
         plan,
         config,
         extra_depends,
-        compressor_config,
-        mtime,
+        ctx.compressor_config,
+        ctx.mtime,
+        Some(md5_map),
     )?;
-    progress.stage_finish(BuildStage::WritingControl);
 
     // Assemble ar archive.
-    progress.stage_start(BuildStage::Assembling, 0, 0);
     let output_file = File::create(output_path).map_err(|e| DebError::SourceFile {
         path: output_path.to_owned(),
         source: e,
     })?;
     let mut ar = ArWriter::new(output_file);
 
-    ar.write_member("debian-binary", b"2.0\n", mtime, 0o100644)?;
+    ar.write_member("debian-binary", b"2.0\n", ctx.mtime, 0o100644)?;
 
-    let control_name = format!("control.tar{compress_ext}");
-    ar.begin_member(&control_name, control_size, mtime, 0o100644)?;
+    let control_name = format!("control.tar{}", ctx.compress_ext);
+    ar.begin_member(&control_name, control_size, ctx.mtime, 0o100644)?;
     let mut control_file = File::open(control_tmp.path())?;
     io::copy(&mut control_file, ar.writer_mut())?;
     ar.finish_member()?;
 
-    let data_name = format!("data.tar{compress_ext}");
-    ar.begin_member(&data_name, data_size, mtime, 0o100644)?;
+    let data_name = format!("data.tar{}", ctx.compress_ext);
+    ar.begin_member(&data_name, data_size, ctx.mtime, 0o100644)?;
     let mut data_file = File::open(data_tmp.path())?;
     io::copy(&mut data_file, ar.writer_mut())?;
     ar.finish_member()?;
 
     ar.finish()?;
-    progress.stage_finish(BuildStage::Assembling);
     Ok(())
 }
 
-/// Write a compressed data tar to a temp file. Returns the temp file and its size.
+/// Write a compressed data tar to a temp file.
+///
+/// Returns the temp file, its size, and a map of pre-computed MD5 hashes
+/// (install_path -> hex digest) collected during the tar write pass.
 fn write_data_tar(
     files: &[FileEntry],
     compressor_config: &CompressorConfig,
     mtime: u64,
     progress: &dyn BuildProgress,
-) -> Result<(tempfile::NamedTempFile, u64), DebError> {
+) -> Result<(tempfile::NamedTempFile, u64, HashMap<PathBuf, String>), DebError> {
     let tmp = tempfile::NamedTempFile::new()?;
+    let mut md5_map = HashMap::new();
     {
         let compressor = compress_writer(compressor_config, &tmp)?;
         let mut tar = TarBuilder::new(compressor);
 
         for entry in files {
-            write_tar_entry(&mut tar, entry, mtime)?;
+            if let Some(hash) = write_tar_entry(&mut tar, entry, mtime)? {
+                md5_map.insert(entry.install_path.clone(), hash);
+            }
             progress.item_completed(entry.size);
         }
 
@@ -495,10 +564,13 @@ fn write_data_tar(
     }
 
     let size = std::fs::metadata(tmp.path())?.len();
-    Ok((tmp, size))
+    Ok((tmp, size, md5_map))
 }
 
 /// Write a compressed control tar to a temp file. Returns the temp file and its size.
+///
+/// When `md5_map` is provided, uses pre-computed hashes instead of re-reading
+/// source files. This eliminates the cold-cache penalty for large packages.
 fn write_control_tar(
     sub_package: &SubPackage,
     plan: &PackagePlan,
@@ -506,6 +578,7 @@ fn write_control_tar(
     extra_depends: &[String],
     compressor_config: &CompressorConfig,
     mtime: u64,
+    md5_map: Option<&HashMap<PathBuf, String>>,
 ) -> Result<(tempfile::NamedTempFile, u64), DebError> {
     let tmp = tempfile::NamedTempFile::new()?;
     {
@@ -516,8 +589,11 @@ fn write_control_tar(
         let control_text = control::generate_control(sub_package, plan, config, extra_depends);
         append_tar_bytes(&mut tar, "./control", control_text.as_bytes(), 0o644, mtime)?;
 
-        // md5sums.
-        let md5sums = control::generate_md5sums(&sub_package.files)?;
+        // md5sums — use pre-computed hashes when available.
+        let md5sums = match md5_map {
+            Some(map) => control::generate_md5sums_precomputed(&sub_package.files, map),
+            None => control::generate_md5sums(&sub_package.files)?,
+        };
         if !md5sums.is_empty() {
             append_tar_bytes(&mut tar, "./md5sums", md5sums.as_bytes(), 0o644, mtime)?;
         }
@@ -551,11 +627,14 @@ fn write_control_tar(
 }
 
 /// Write a single file entry into a tar archive.
+///
+/// Returns the MD5 hex digest for regular files, `None` for all other types.
+/// This avoids a separate read pass for md5sums generation.
 fn write_tar_entry<W: Write>(
     tar: &mut TarBuilder<W>,
     entry: &FileEntry,
     mtime: u64,
-) -> Result<(), DebError> {
+) -> Result<Option<String>, DebError> {
     let install_path = entry.install_path.to_string_lossy();
     // DEB convention: paths are prefixed with "./"
     let tar_path = if install_path.starts_with('/') {
@@ -569,10 +648,10 @@ fn write_tar_entry<W: Write>(
     header.set_uid(0);
     header.set_gid(0);
     header
-        .set_username("root")
+        .set_username(&entry.user)
         .map_err(|e| DebError::Tar(e.to_string()))?;
     header
-        .set_groupname("root")
+        .set_groupname(&entry.group)
         .map_err(|e| DebError::Tar(e.to_string()))?;
 
     match &entry.entry_type {
@@ -581,12 +660,14 @@ fn write_tar_entry<W: Write>(
             header.set_mode(entry.mode);
             header.set_size(entry.size);
 
-            let mut file = File::open(&entry.source_path).map_err(|e| DebError::SourceFile {
+            let file = File::open(&entry.source_path).map_err(|e| DebError::SourceFile {
                 path: entry.source_path.clone(),
                 source: e,
             })?;
-            tar.append_data(&mut header, &tar_path, &mut file)
+            let mut hashing = HashingReader::new(file);
+            tar.append_data(&mut header, &tar_path, &mut hashing)
                 .map_err(|e| DebError::Tar(e.to_string()))?;
+            return Ok(Some(hashing.finalize_hex()));
         }
         EntryType::Directory => {
             header.set_entry_type(TarEntryType::Directory);
@@ -622,7 +703,7 @@ fn write_tar_entry<W: Write>(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Append an in-memory file to a tar archive.
@@ -672,17 +753,25 @@ fn make_compressor_config(algorithm: &Algorithm, config: &Config) -> CompressorC
 
 /// Resolve the build timestamp, using `source_date_epoch` for reproducible builds.
 fn resolve_mtime(config: &Config) -> u64 {
-    config
+    if let Some(epoch_str) = config
         .build
         .as_ref()
         .and_then(|b| b.source_date_epoch.as_ref())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        })
+    {
+        match epoch_str.parse::<u64>() {
+            Ok(v) => return v,
+            Err(_) => {
+                eprintln!(
+                    "warning: source_date_epoch '{}' is not a valid integer, using current time",
+                    epoch_str
+                );
+            }
+        }
+    }
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -764,7 +853,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, size) = write_data_tar(&[], &config, 0, &NoopProgress).unwrap();
+        let (tmp, size, _md5s) = write_data_tar(&[], &config, 0, &NoopProgress).unwrap();
         // Even an empty tar has the two 512-byte zero blocks = 1024 bytes.
         assert!(size >= 1024);
         assert!(tmp.path().exists());
@@ -791,7 +880,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _size) = write_data_tar(&files, &config, 1000, &NoopProgress).unwrap();
+        let (tmp, _size, _md5s) = write_data_tar(&files, &config, 1000, &NoopProgress).unwrap();
 
         // Read back and verify the tar contains our file.
         // Note: the tar crate's path() strips the "./" prefix on readback.
@@ -825,7 +914,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
+        let (tmp, _, _md5s) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -864,7 +953,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
+        let (tmp, _, _md5s) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -900,7 +989,7 @@ mod tests {
             level: Some(1),
             threads: 0,
         };
-        let (tmp, size) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
+        let (tmp, size, _md5s) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
         assert!(size > 0);
 
         // Decompress and verify.
@@ -936,7 +1025,7 @@ mod tests {
             level: None,
             threads: 0,
         };
-        let (tmp, _) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
+        let (tmp, _, _md5s) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -971,7 +1060,7 @@ mod tests {
         };
 
         let (tmp, _) =
-            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0).unwrap();
+            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0, None).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -1001,7 +1090,7 @@ mod tests {
         };
 
         let (tmp, _) =
-            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0).unwrap();
+            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0, None).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -1031,7 +1120,7 @@ mod tests {
         };
 
         let (tmp, _) =
-            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0).unwrap();
+            write_control_tar(&sub_pkg, &plan, &config, &[], &compressor_config, 0, None).unwrap();
 
         let file = File::open(tmp.path()).unwrap();
         let mut archive = tar::Archive::new(file);

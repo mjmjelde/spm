@@ -591,7 +591,7 @@ fn cmd_build(
                     } else {
                         paths[0]
                             .file_name()
-                            .unwrap()
+                            .unwrap_or_else(|| paths[0].as_os_str())
                             .to_string_lossy()
                             .to_string()
                     };

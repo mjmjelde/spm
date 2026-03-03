@@ -130,46 +130,54 @@ impl HeaderBuilder {
         }
     }
 
+    /// Push an entry, asserting no duplicate tags in debug builds.
+    fn push_entry(&mut self, tag: u32, value: TagValue) {
+        debug_assert!(
+            !self.entries.iter().any(|(t, _)| *t == tag),
+            "duplicate RPM header tag {tag}"
+        );
+        self.entries.push((tag, value));
+    }
+
     /// Add a single string tag.
     pub fn add_string(&mut self, tag: u32, value: &str) -> &mut Self {
-        self.entries.push((tag, TagValue::String(value.to_owned())));
+        self.push_entry(tag, TagValue::String(value.to_owned()));
         self
     }
 
     /// Add a string array tag.
     pub fn add_string_array(&mut self, tag: u32, values: Vec<String>) -> &mut Self {
-        self.entries.push((tag, TagValue::StringArray(values)));
+        self.push_entry(tag, TagValue::StringArray(values));
         self
     }
 
     /// Add an internationalized string tag.
     pub fn add_i18n_string(&mut self, tag: u32, value: &str) -> &mut Self {
-        self.entries
-            .push((tag, TagValue::I18NString(value.to_owned())));
+        self.push_entry(tag, TagValue::I18NString(value.to_owned()));
         self
     }
 
     /// Add an INT32 array tag.
     pub fn add_int32(&mut self, tag: u32, values: Vec<i32>) -> &mut Self {
-        self.entries.push((tag, TagValue::Int32(values)));
+        self.push_entry(tag, TagValue::Int32(values));
         self
     }
 
     /// Add an INT64 array tag.
     pub fn add_int64(&mut self, tag: u32, values: Vec<i64>) -> &mut Self {
-        self.entries.push((tag, TagValue::Int64(values)));
+        self.push_entry(tag, TagValue::Int64(values));
         self
     }
 
     /// Add an INT16 array tag.
     pub fn add_int16(&mut self, tag: u32, values: Vec<i16>) -> &mut Self {
-        self.entries.push((tag, TagValue::Int16(values)));
+        self.push_entry(tag, TagValue::Int16(values));
         self
     }
 
     /// Add a binary blob tag.
     pub fn add_bin(&mut self, tag: u32, data: Vec<u8>) -> &mut Self {
-        self.entries.push((tag, TagValue::Bin(data)));
+        self.push_entry(tag, TagValue::Bin(data));
         self
     }
 
@@ -196,7 +204,7 @@ impl HeaderBuilder {
         trailer.extend_from_slice(&neg_offset.to_be_bytes());
         trailer.extend_from_slice(&16u32.to_be_bytes());
 
-        self.entries.push((tag, TagValue::Bin(trailer)));
+        self.push_entry(tag, TagValue::Bin(trailer));
         self
     }
 
@@ -261,6 +269,9 @@ impl HeaderBuilder {
         }
 
         // Build index entries sorted by tag number (required by RPM binary search).
+        // Region tags (62, 63) must sort AFTER all regular tags so that data
+        // offsets remain monotonically non-decreasing — their data lives at the
+        // end of the data section.
         let mut index_entries: Vec<IndexEntry> = entry_offsets
             .iter()
             .map(|&(tag, tag_type, offset, count)| IndexEntry {
@@ -270,7 +281,13 @@ impl HeaderBuilder {
                 count,
             })
             .collect();
-        index_entries.sort_by_key(|e| e.tag);
+        index_entries.sort_by_key(|e| {
+            if REGION_TAGS.contains(&e.tag) {
+                (1, e.tag)
+            } else {
+                (0, e.tag)
+            }
+        });
 
         // Assemble the full header.
         let index_count = index_entries.len() as u32;

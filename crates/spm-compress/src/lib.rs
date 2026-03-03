@@ -19,6 +19,7 @@
 //! {
 //!     let mut writer = compress_writer(&config, &mut output).unwrap();
 //!     writer.write_all(b"hello world").unwrap();
+//!     writer.finish().unwrap();
 //! }
 //! assert!(!output.is_empty());
 //! ```
@@ -147,7 +148,7 @@ pub struct FinishableWriter<'a> {
 }
 
 enum FinishableInner<'a> {
-    Zstd(Box<dyn Write + 'a>),
+    Zstd(zstd::stream::Encoder<'static, Box<dyn Write + 'a>>),
     Gzip(flate2::write::GzEncoder<Box<dyn Write + 'a>>),
     Xz(xz2::write::XzEncoder<Box<dyn Write + 'a>>),
     None(Box<dyn Write + 'a>),
@@ -180,7 +181,10 @@ impl<'a> FinishableWriter<'a> {
     /// this method propagates any errors that occur during finalization.
     pub fn finish(self) -> std::io::Result<()> {
         match self.inner {
-            FinishableInner::Zstd(mut w) => w.flush(),
+            FinishableInner::Zstd(w) => {
+                w.finish()?;
+                Ok(())
+            }
             FinishableInner::Gzip(w) => {
                 w.finish()?;
                 Ok(())
@@ -214,20 +218,32 @@ pub fn compress_writer<'a, W: Write + 'a>(
             let mut encoder = zstd::stream::Encoder::new(boxed, config.effective_level())?;
             encoder.multithread(config.effective_threads() as u32)?;
             Ok(FinishableWriter {
-                inner: FinishableInner::Zstd(Box::new(encoder.auto_finish())),
+                inner: FinishableInner::Zstd(encoder),
             })
         }
         Algorithm::Gzip => {
+            let level = config.effective_level();
+            if !(0..=9).contains(&level) {
+                return Err(CompressError::Io(std::io::Error::other(format!(
+                    "gzip compression level {level} out of range (0-9)"
+                ))));
+            }
             let encoder = flate2::write::GzEncoder::new(
                 boxed,
-                flate2::Compression::new(config.effective_level() as u32),
+                flate2::Compression::new(level as u32),
             );
             Ok(FinishableWriter {
                 inner: FinishableInner::Gzip(encoder),
             })
         }
         Algorithm::Xz => {
-            let level = config.effective_level() as u32;
+            let level = config.effective_level();
+            if !(0..=9).contains(&level) {
+                return Err(CompressError::Io(std::io::Error::other(format!(
+                    "xz compression level {level} out of range (0-9)"
+                ))));
+            }
+            let level = level as u32;
             let threads = config.effective_threads() as u32;
             if threads > 1 {
                 let stream = xz2::stream::MtStreamBuilder::new()
@@ -299,7 +315,7 @@ mod tests {
             };
             let mut writer = compress_writer(&config, &mut compressed).unwrap();
             writer.write_all(&original).unwrap();
-            // writer dropped here, flushing
+            writer.finish().unwrap();
         }
         // Compressed should be much smaller than original
         assert!(compressed.len() < original.len() / 10);
@@ -380,6 +396,7 @@ mod tests {
             };
             let mut writer = compress_writer(&config, &mut compressed).unwrap();
             writer.write_all(&[]).unwrap();
+            writer.finish().unwrap();
         }
         // Compressed output should be non-empty (stream header + trailer)
         assert!(!compressed.is_empty());
@@ -503,6 +520,7 @@ mod tests {
             };
             let mut writer = compress_writer(&config, &mut compressed).unwrap();
             writer.write_all(&original).unwrap();
+            writer.finish().unwrap();
         }
         let mut decompressed = Vec::new();
         let mut reader = decompress_reader(Algorithm::Zstd, &compressed[..]).unwrap();
@@ -573,6 +591,7 @@ mod tests {
             };
             let mut writer = compress_writer(&config, &mut compressed).unwrap();
             writer.write_all(&original).unwrap();
+            writer.finish().unwrap();
         }
         let mut decompressed = Vec::new();
         zstd::stream::copy_decode(&compressed[..], &mut decompressed).unwrap();

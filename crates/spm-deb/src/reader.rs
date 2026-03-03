@@ -3,7 +3,7 @@
 //! Parses an existing DEB file to extract control metadata.
 //! Used by `spm inspect` to display information about built packages.
 
-use std::io::Read;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::DebError;
@@ -33,86 +33,88 @@ impl DebMetadata {
 }
 
 /// Read metadata from an existing DEB file.
+///
+/// Uses streaming I/O — only reads ar headers and the control.tar member,
+/// avoiding loading multi-GiB data.tar members into memory.
 pub fn read_deb_metadata(path: &Path) -> Result<DebMetadata, DebError> {
-    let data = std::fs::read(path).map_err(|e| DebError::SourceFile {
+    let file = std::fs::File::open(path).map_err(|e| DebError::SourceFile {
         path: path.to_owned(),
         source: e,
     })?;
+    let mut reader = BufReader::new(file);
 
-    if data.len() < AR_MAGIC.len() {
-        return Err(DebError::InvalidDeb("file too small".into()));
-    }
-    if &data[..8] != AR_MAGIC.as_slice() {
+    // Read and verify ar magic.
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|_| DebError::InvalidDeb("file too small".into()))?;
+    if magic != *AR_MAGIC {
         return Err(DebError::InvalidDeb("not a DEB file (bad ar magic)".into()));
     }
 
-    // Find the control.tar member.
-    let (member_name, member_data) = find_control_tar(&data)?;
+    // Find the control.tar member by streaming through ar headers.
+    let (member_name, member_data) = find_control_tar_streaming(&mut reader)?;
 
     // Decompress and extract the control file.
-    let control_content = extract_control_file(member_name, member_data)?;
+    let control_content = extract_control_file(&member_name, &member_data)?;
 
     Ok(parse_control_file(&control_content))
 }
 
-/// Walk ar members to find the control.tar member.
-/// Returns the member name and its raw data slice.
-fn find_control_tar(data: &[u8]) -> Result<(&str, &[u8]), DebError> {
-    let mut offset = 8; // Skip ar magic.
+/// Stream through ar members to find and read the control.tar member.
+/// Only reads header bytes and the (small) control.tar data; skips over
+/// large data.tar members using seek.
+fn find_control_tar_streaming<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<(String, Vec<u8>), DebError> {
+    let mut header_buf = [0u8; AR_HEADER_SIZE];
 
-    while offset + AR_HEADER_SIZE <= data.len() {
-        let (name, data_offset, data_size, next_offset) = parse_ar_header(data, offset)?;
-
-        if name.starts_with("control.tar") {
-            if data_offset + data_size > data.len() {
-                return Err(DebError::InvalidDeb("control.tar member truncated".into()));
+    loop {
+        // Try to read the next ar member header.
+        match reader.read_exact(&mut header_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(DebError::InvalidDeb("no control.tar member found".into()));
             }
-            // Return name from header and the data slice.
-            let name_str = std::str::from_utf8(&data[offset..offset + 16])
-                .unwrap_or("")
-                .trim_end_matches(['/', ' ']);
-            return Ok((name_str, &data[data_offset..data_offset + data_size]));
+            Err(e) => return Err(DebError::Tar(e.to_string())),
         }
 
-        offset = next_offset;
+        // Validate file magic (last 2 bytes of header).
+        if &header_buf[58..60] != b"`\n" {
+            return Err(DebError::InvalidDeb(
+                "invalid ar member header magic".into(),
+            ));
+        }
+
+        // Name is first 16 bytes, right-padded with spaces.
+        let name = std::str::from_utf8(&header_buf[0..16])
+            .map_err(|_| DebError::InvalidDeb("non-UTF8 ar member name".into()))?
+            .trim_end_matches(['/', ' '])
+            .to_string();
+
+        // Size is bytes 48..58, ASCII decimal, space-padded.
+        let size_str = std::str::from_utf8(&header_buf[48..58])
+            .unwrap_or("0")
+            .trim();
+        let data_size: u64 = size_str
+            .parse()
+            .map_err(|_| DebError::InvalidDeb(format!("invalid ar member size: '{size_str}'")))?;
+
+        if name.starts_with("control.tar") {
+            // control.tar is small (typically a few KB) — read it entirely.
+            let mut data = vec![0u8; data_size as usize];
+            reader
+                .read_exact(&mut data)
+                .map_err(|_| DebError::InvalidDeb("control.tar member truncated".into()))?;
+            return Ok((name, data));
+        }
+
+        // Skip this member's data (+ padding to even boundary).
+        let skip = data_size + (data_size % 2);
+        reader
+            .seek(SeekFrom::Current(skip as i64))
+            .map_err(|e| DebError::Tar(e.to_string()))?;
     }
-
-    Err(DebError::InvalidDeb("no control.tar member found".into()))
-}
-
-/// Parse an ar member header at the given offset.
-/// Returns (name, data_offset, data_size, next_member_offset).
-fn parse_ar_header(data: &[u8], offset: usize) -> Result<(String, usize, usize, usize), DebError> {
-    if offset + AR_HEADER_SIZE > data.len() {
-        return Err(DebError::InvalidDeb("truncated ar header".into()));
-    }
-
-    let header = &data[offset..offset + AR_HEADER_SIZE];
-
-    // Validate file magic (last 2 bytes of header).
-    if &header[58..60] != b"`\n" {
-        return Err(DebError::InvalidDeb(
-            "invalid ar member header magic".into(),
-        ));
-    }
-
-    // Name is first 16 bytes, right-padded with spaces.
-    let name = std::str::from_utf8(&header[0..16])
-        .unwrap_or("")
-        .trim_end_matches(['/', ' '])
-        .to_string();
-
-    // Size is bytes 48..58, ASCII decimal, space-padded.
-    let size_str = std::str::from_utf8(&header[48..58]).unwrap_or("0").trim();
-    let data_size: usize = size_str
-        .parse()
-        .map_err(|_| DebError::InvalidDeb(format!("invalid ar member size: '{size_str}'")))?;
-
-    let data_offset = offset + AR_HEADER_SIZE;
-    // Next member is aligned to even boundary.
-    let next_offset = data_offset + data_size + (data_size % 2);
-
-    Ok((name, data_offset, data_size, next_offset))
 }
 
 /// Detect compression from the control.tar member name and decompress.

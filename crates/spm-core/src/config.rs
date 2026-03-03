@@ -360,12 +360,15 @@ pub struct BuildConfig {
 impl Config {
     /// Load config from a YAML file, expanding environment variables.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        if !path.exists() {
-            return Err(ConfigError::NotFound(path.to_owned()));
-        }
-        let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
-            path: path.to_owned(),
-            source: e,
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::NotFound(path.to_owned())
+            } else {
+                ConfigError::Io {
+                    path: path.to_owned(),
+                    source: e,
+                }
+            }
         })?;
         // Expand ${VAR} references before parsing
         let expanded =
@@ -457,12 +460,17 @@ impl Config {
             ));
         }
         if let Some(ref max_size) = self.splitting.max_size {
-            crate::types::parse_size(max_size).map_err(|reason| {
+            let parsed = crate::types::parse_size(max_size).map_err(|reason| {
                 ConfigError::Validation(format!(
                     "splitting.max_size '{}' is invalid: {}",
                     max_size, reason
                 ))
             })?;
+            if parsed == 0 {
+                return Err(ConfigError::Validation(
+                    "splitting.max_size must be greater than 0".to_string(),
+                ));
+            }
         }
         Ok(())
     }
