@@ -370,9 +370,11 @@ impl Config {
                 }
             }
         })?;
-        // Expand ${VAR} references before parsing
-        let expanded =
-            shellexpand::env(&raw).map_err(|e| ConfigError::EnvVar(e.var_name.to_string()))?;
+        // Expand ${VAR} references before parsing; unknown vars pass through
+        // so that inline shell scripts with $VAR references are preserved.
+        let expanded = shellexpand::env_with_context_no_errors(&raw, |var_name| {
+            std::env::var(var_name).ok()
+        });
         let config: Config = serde_yaml::from_str(&expanded)?;
         config.validate()?;
         let config_dir = path.parent().unwrap_or(Path::new("."));
@@ -542,7 +544,9 @@ mod tests {
         // validation (/opt/matlab-staging/R2025a may not exist in CI).
         let path = fixtures_dir().join("full.yaml");
         let raw = std::fs::read_to_string(&path).expect("should read full.yaml");
-        let expanded = shellexpand::env(&raw).expect("env expansion should succeed");
+        let expanded = shellexpand::env_with_context_no_errors(&raw, |var_name| {
+            std::env::var(var_name).ok()
+        });
         let config: Config = serde_yaml::from_str(&expanded).expect("should parse full config");
         config
             .validate()
@@ -602,14 +606,16 @@ package:
   description: test env expansion
 content: {}
 "#;
-        let expanded = shellexpand::env(yaml).expect("env expansion should succeed");
+        let expanded = shellexpand::env_with_context_no_errors(yaml, |var_name| {
+            std::env::var(var_name).ok()
+        });
         let config: Config = serde_yaml::from_str(&expanded).expect("should parse");
         config.validate().expect("should validate");
         assert_eq!(config.package.version, "42.0");
     }
 
     #[test]
-    fn test_env_var_missing() {
+    fn test_env_var_missing_passes_through() {
         let yaml = r#"
 package:
   name: envtest
@@ -620,8 +626,44 @@ package:
   description: test
 content: {}
 "#;
-        let result = shellexpand::env(yaml);
-        assert!(result.is_err());
+        let expanded = shellexpand::env_with_context_no_errors(yaml, |var_name| {
+            std::env::var(var_name).ok()
+        });
+        let config: Config = serde_yaml::from_str(&expanded).expect("should parse");
+        assert_eq!(config.package.version, "${SPM_NONEXISTENT_VAR_12345}");
+    }
+
+    #[test]
+    fn test_inline_script_shell_vars_not_expanded() {
+        let yaml = r#"
+package:
+  name: scripttest
+  version: "1.0"
+  arch: x86_64
+  license: MIT
+  maintainer: test
+  description: test
+
+content:
+  files:
+    - src: /opt/app
+      dst: /opt/app
+
+scripts:
+  post_install: |
+    #!/bin/bash
+    LINK_DIR="/usr/local/bin"
+    ln -sf "${MATLAB_ROOT}/bin/matlab" "${LINK_DIR}/matlab"
+"#;
+        let expanded = shellexpand::env_with_context_no_errors(yaml, |var_name| {
+            std::env::var(var_name).ok()
+        });
+        let config: Config = serde_yaml::from_str(&expanded).expect("should parse");
+        assert_eq!(config.package.name, "scripttest");
+        let script = config.scripts.post_install.as_ref().unwrap();
+        let script_str = script.to_str().unwrap();
+        assert!(script_str.contains("${MATLAB_ROOT}"));
+        assert!(script_str.contains("${LINK_DIR}"));
     }
 
     #[test]
