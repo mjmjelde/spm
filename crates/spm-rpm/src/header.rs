@@ -218,10 +218,12 @@ impl HeaderBuilder {
     /// Returns the complete header: magic (4) + reserved (4) + index count (4) +
     /// data size (4) + index entries (16 each) + data section.
     ///
-    /// RPM requires both index entries AND data to be ordered by tag number
-    /// (data offsets must be monotonically increasing when iterating by tag).
-    /// Region tags (62, 63) are the exception: their data goes at the end of
-    /// the data section regardless of tag number.
+    /// RPM requires index entries to be sorted in ascending tag order.
+    /// Data offsets must be monotonically increasing for regular tags.
+    /// Region tags (62, 63) are special: their data goes at the end of
+    /// the data section, but their index entries sort by natural tag number
+    /// (first, since 62/63 are the lowest). RPM skips offset monotonicity
+    /// checks for region tag entries.
     pub fn build(&self) -> Result<Vec<u8>, RpmError> {
         if self.entries.is_empty() {
             return Err(RpmError::Header("header has no entries".into()));
@@ -231,22 +233,23 @@ impl HeaderBuilder {
         // data placed at the END of the data section, regardless of tag order.
         const REGION_TAGS: [u32; 2] = [62, 63];
 
-        // Sort entries by tag number, then partition: regular first, region last.
-        let mut sorted: Vec<&(u32, TagValue)> = self.entries.iter().collect();
-        sorted.sort_by_key(|(tag, _)| {
+        // Sort entries for DATA layout: regular tags by tag number first,
+        // region tags at the end (their data must be last in the data section).
+        let mut data_sorted: Vec<&(u32, TagValue)> = self.entries.iter().collect();
+        data_sorted.sort_by_key(|(tag, _)| {
             if REGION_TAGS.contains(tag) {
-                (1, *tag) // region tags sort after all regular tags
+                (1, *tag) // region tags' data goes after all regular tags
             } else {
                 (0, *tag)
             }
         });
 
-        // Build the data section in sorted order.
+        // Build the data section in data-layout order.
         let mut data = Vec::new();
         let mut entry_offsets: Vec<(u32, TagType, i32, u32)> =
             Vec::with_capacity(self.entries.len());
 
-        for (tag, value) in &sorted {
+        for (tag, value) in &data_sorted {
             // Insert alignment padding.
             let align = value.alignment();
             let pad = (align - (data.len() % align)) % align;
@@ -268,10 +271,10 @@ impl HeaderBuilder {
             entry_offsets.push((*tag, tag_type, offset, count));
         }
 
-        // Build index entries sorted by tag number (required by RPM binary search).
-        // Region tags (62, 63) must sort AFTER all regular tags so that data
-        // offsets remain monotonically non-decreasing — their data lives at the
-        // end of the data section.
+        // Build index entries sorted by NATURAL tag number (ascending).
+        // Region tags (62, 63) have the lowest numbers so they sort first.
+        // RPM's hdrblobVerifyInfo() requires strict ascending tag order in
+        // the index but skips offset monotonicity checks for region tags.
         let mut index_entries: Vec<IndexEntry> = entry_offsets
             .iter()
             .map(|&(tag, tag_type, offset, count)| IndexEntry {
@@ -281,13 +284,7 @@ impl HeaderBuilder {
                 count,
             })
             .collect();
-        index_entries.sort_by_key(|e| {
-            if REGION_TAGS.contains(&e.tag) {
-                (1, e.tag)
-            } else {
-                (0, e.tag)
-            }
-        });
+        index_entries.sort_by_key(|e| e.tag);
 
         // Assemble the full header.
         let index_count = index_entries.len() as u32;
@@ -488,5 +485,50 @@ mod tests {
 
         let data_size = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
         assert_eq!(data_size, 6);
+    }
+
+    #[test]
+    fn test_region_tag_index_first_data_last() {
+        let mut hdr = HeaderBuilder::new();
+        hdr.add_string(1000, "name");
+        hdr.add_string(1001, "version");
+        hdr.add_region_tag(62);
+
+        let bytes = hdr.build().unwrap();
+
+        let index_count = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(index_count, 3);
+
+        // First index entry should be tag 62 (lowest tag number).
+        let tag0 = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        assert_eq!(tag0, 62, "region tag must be first in index");
+
+        // Second and third should be 1000, 1001.
+        let tag1 = u32::from_be_bytes(bytes[32..36].try_into().unwrap());
+        let tag2 = u32::from_be_bytes(bytes[48..52].try_into().unwrap());
+        assert_eq!(tag1, 1000);
+        assert_eq!(tag2, 1001);
+
+        // Region tag's data offset must be the highest (data is last).
+        let offset0 = i32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        let offset1 = i32::from_be_bytes(bytes[40..44].try_into().unwrap());
+        let offset2 = i32::from_be_bytes(bytes[56..60].try_into().unwrap());
+        assert!(
+            offset0 > offset1 && offset0 > offset2,
+            "region tag data offset ({offset0}) must be greater than regular tag offsets ({offset1}, {offset2})"
+        );
+    }
+
+    #[test]
+    fn test_immutable_region_tag_sorts_first() {
+        let mut hdr = HeaderBuilder::new();
+        hdr.add_string(1000, "name");
+        hdr.add_int32(1009, vec![42]);
+        hdr.add_region_tag(63);
+
+        let bytes = hdr.build().unwrap();
+
+        let tag0 = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        assert_eq!(tag0, 63, "immutable region tag must be first in index");
     }
 }

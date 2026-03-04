@@ -122,6 +122,8 @@ pub const RPMTAG_LONGFILESIZES: u32 = 5008;
 pub const RPMTAG_LONGSIZE: u32 = 5009;
 /// Digest algorithm identifier.
 pub const RPMTAG_FILEDIGESTALGO: u32 = 5011;
+/// Header string encoding declaration (RPM 4.14+).
+pub const RPMTAG_ENCODING: u32 = 5062;
 
 // ── Dependency tags ────────────────────────────────────────────────
 

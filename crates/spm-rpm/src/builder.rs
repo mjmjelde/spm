@@ -266,6 +266,9 @@ fn add_package_metadata(
         .unwrap_or_else(|| "9".to_owned());
     hdr.add_string(RPMTAG_PAYLOADFLAGS, &payload_flags);
 
+    // Header encoding (RPM 4.14+, declares string encoding as UTF-8).
+    hdr.add_string(RPMTAG_ENCODING, "utf-8");
+
     Ok(())
 }
 
