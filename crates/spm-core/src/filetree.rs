@@ -458,10 +458,61 @@ fn parse_mode(mode_str: &str) -> Result<u32, FileTreeError> {
     })
 }
 
+/// Well-known system directories that should never be owned by a package.
+///
+/// These are standard FHS paths owned by the `filesystem` package on RPM distros
+/// and `base-files` on DEB distros. Owning them causes install conflicts.
+fn is_system_directory(path: &Path) -> bool {
+    static SYSTEM_DIRS: &[&str] = &[
+        "/usr",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/libexec",
+        "/usr/share",
+        "/usr/share/man",
+        "/usr/share/doc",
+        "/usr/share/info",
+        "/usr/include",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/local/lib",
+        "/usr/local/share",
+        "/usr/local/include",
+        "/etc",
+        "/var",
+        "/var/lib",
+        "/var/log",
+        "/var/run",
+        "/var/cache",
+        "/var/tmp",
+        "/opt",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/tmp",
+        "/run",
+        "/srv",
+        "/home",
+        "/root",
+        "/mnt",
+        "/media",
+        "/boot",
+        "/dev",
+        "/proc",
+        "/sys",
+    ];
+    SYSTEM_DIRS.iter().any(|d| path == Path::new(d))
+}
+
 /// Add implicit parent directory entries for all files.
 ///
-/// For a file at /opt/app/bin/tool, ensures /opt/, /opt/app/, and /opt/app/bin/
-/// exist as directory entries. Uses global defaults for mode/user/group.
+/// For a file at /opt/app/bin/tool, ensures /opt/app/ and /opt/app/bin/
+/// exist as directory entries. Well-known system directories (e.g. /opt,
+/// /usr, /usr/bin) are excluded to avoid conflicts with the filesystem
+/// package. Uses global defaults for mode/user/group.
 fn add_implicit_directories(
     entries: &mut Vec<FileEntry>,
     seen: &mut HashSet<PathBuf>,
@@ -476,6 +527,9 @@ fn add_implicit_directories(
                 break;
             }
             let parent_buf = parent.to_path_buf();
+            if is_system_directory(&parent_buf) {
+                break; // System dir — don't own it or any of its parents.
+            }
             if seen.contains(&parent_buf) {
                 break; // Already have this dir (and therefore all its parents).
             }
@@ -838,7 +892,37 @@ mod tests {
 
         assert!(dir_paths.contains(&PathBuf::from("/opt/app/bin")));
         assert!(dir_paths.contains(&PathBuf::from("/opt/app")));
-        assert!(dir_paths.contains(&PathBuf::from("/opt")));
+        assert!(
+            !dir_paths.contains(&PathBuf::from("/opt")),
+            "system dir /opt should not be owned"
+        );
+    }
+
+    #[test]
+    fn test_walk_system_dirs_not_owned() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        fs::write(base.join("spm"), "binary").unwrap();
+
+        let content = test_content(vec![FileMapping {
+            src: format!("{}/spm", base.display()),
+            dst: "/usr/bin/spm".to_string(),
+            mode: None,
+            dir_mode: None,
+            user: None,
+            group: None,
+            r#type: None,
+        }]);
+
+        let entries = FileTree::walk(&content).unwrap();
+        let dir_paths: HashSet<PathBuf> = entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, EntryType::Directory))
+            .map(|e| e.install_path.clone())
+            .collect();
+
+        // /usr and /usr/bin are system directories — should not be owned.
+        assert!(dir_paths.is_empty(), "no directories should be owned for /usr/bin/spm, got: {dir_paths:?}");
     }
 
     #[test]
