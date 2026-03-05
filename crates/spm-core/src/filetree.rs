@@ -922,7 +922,10 @@ mod tests {
             .collect();
 
         // /usr and /usr/bin are system directories — should not be owned.
-        assert!(dir_paths.is_empty(), "no directories should be owned for /usr/bin/spm, got: {dir_paths:?}");
+        assert!(
+            dir_paths.is_empty(),
+            "no directories should be owned for /usr/bin/spm, got: {dir_paths:?}"
+        );
     }
 
     #[test]

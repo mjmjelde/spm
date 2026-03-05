@@ -316,8 +316,8 @@ pub fn build_streaming_split(
     }
 
     for (i, entry) in all_files.iter().enumerate() {
-        // Skip directories (already written) and hardlinks (pulled in with target).
-        if included[i] {
+        // Skip directories (already written) and hardlink entries (pulled in with their target).
+        if included[i] || families.is_link(i) {
             continue;
         }
 
@@ -565,11 +565,30 @@ fn write_data_tar(
         let compressor = compress_writer(compressor_config, &tmp)?;
         let mut tar = TarBuilder::new(compressor);
 
-        for entry in files {
+        // Pre-scan hardlink families so targets are written before their links.
+        let families = HardlinkFamilies::scan(files);
+
+        for (i, entry) in files.iter().enumerate() {
+            // Skip hardlink entries; they are pulled in after their target.
+            if families.is_link(i) {
+                continue;
+            }
+
             if let Some(hash) = write_tar_entry(&mut tar, entry, mtime)? {
                 md5_map.insert(entry.install_path.clone(), hash);
             }
             progress.item_completed(entry.size);
+
+            // If this file is a hardlink target, write all its links now.
+            if let Some(link_indices) = families.links_for_target(&entry.install_path) {
+                for &li in link_indices {
+                    let link_entry = &files[li];
+                    if let Some(hash) = write_tar_entry(&mut tar, link_entry, mtime)? {
+                        md5_map.insert(link_entry.install_path.clone(), hash);
+                    }
+                    progress.item_completed(link_entry.size);
+                }
+            }
         }
 
         // Finalize the tar (writes two 512-byte zero blocks).
@@ -981,6 +1000,80 @@ mod tests {
         assert_eq!(entries[0].header().entry_type(), TarEntryType::Symlink);
         let link_name = entries[0].link_name().unwrap().unwrap();
         assert_eq!(link_name.to_str().unwrap(), "/usr/bin/real");
+    }
+
+    #[test]
+    fn test_write_data_tar_hardlink_target_after_link_in_sort_order() {
+        // Regression test: when a hardlink's install_path sorts before its
+        // target's install_path, the target must still appear first in the tar
+        // so that dpkg can create the hard link during extraction.
+        let dir = tempfile::tempdir().unwrap();
+        let src = create_temp_file(dir.path(), "real_file", b"real content here");
+
+        // The target sorts AFTER the link alphabetically (/usr > /opt).
+        let files = vec![
+            FileEntry {
+                install_path: PathBuf::from("/opt/bin/link"),
+                source_path: PathBuf::new(),
+                entry_type: EntryType::Hardlink {
+                    target: PathBuf::from("/usr/local/bin/real"),
+                },
+                size: 0,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+            FileEntry {
+                install_path: PathBuf::from("/usr/local/bin/real"),
+                source_path: src,
+                entry_type: EntryType::RegularFile,
+                size: 17,
+                mode: 0o755,
+                user: "root".to_string(),
+                group: "root".to_string(),
+                is_config: false,
+            },
+        ];
+
+        let config = CompressorConfig {
+            algorithm: Algorithm::None,
+            level: None,
+            threads: 0,
+        };
+        let (tmp, _, md5s) = write_data_tar(&files, &config, 0, &NoopProgress).unwrap();
+
+        let file = File::open(tmp.path()).unwrap();
+        let mut archive = tar::Archive::new(file);
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // The RegularFile (target) must come first, even though it sorts after the link.
+        assert_eq!(
+            entries[0].header().entry_type(),
+            TarEntryType::Regular,
+            "target must appear before hardlink in tar"
+        );
+        assert_eq!(
+            entries[1].header().entry_type(),
+            TarEntryType::Link,
+            "hardlink must appear after target in tar"
+        );
+
+        // Verify the hardlink's link_name points to the target.
+        let link_name = entries[1].link_name().unwrap().unwrap();
+        assert!(
+            link_name.to_string_lossy().contains("usr/local/bin/real"),
+            "link_name should reference the target: {:?}",
+            link_name
+        );
+
+        // MD5 should be computed for the regular file.
+        assert!(md5s.contains_key(&PathBuf::from("/usr/local/bin/real")));
     }
 
     #[test]
