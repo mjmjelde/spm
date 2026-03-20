@@ -124,6 +124,10 @@ pub const RPMTAG_LONGSIZE: u32 = 5009;
 pub const RPMTAG_FILEDIGESTALGO: u32 = 5011;
 /// Header string encoding declaration (RPM 4.14+).
 pub const RPMTAG_ENCODING: u32 = 5062;
+/// Per-payload SHA-256 digest (RPM 4.14+).
+pub const RPMTAG_PAYLOADDIGEST: u32 = 5092;
+/// Payload digest algorithm identifier (RPM 4.14+).
+pub const RPMTAG_PAYLOADDIGESTALGO: u32 = 5093;
 
 // ── Dependency tags ────────────────────────────────────────────────
 

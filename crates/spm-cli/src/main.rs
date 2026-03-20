@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use spm_core::config::{BuildConfig, Config};
+use spm_core::deps::{self, DepFormat};
 use spm_core::distro::{self, Distro};
 use spm_core::planner::{count_files, Planner, SubPackageRole};
 use spm_core::progress::{BuildProgress, BuildStage};
@@ -254,6 +255,11 @@ fn cmd_validate(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)
         .with_context(|| format!("failed to load config from '{}'", config_path.display()))?;
 
+    let dep_errors = deps::validate_all_deps_lenient(&config.package.dependencies);
+    if !dep_errors.is_empty() {
+        anyhow::bail!("invalid dependencies:\n  {}", dep_errors.join("\n  "));
+    }
+
     println!(
         "Config valid: {} {}-{} ({})",
         config.package.name, config.package.version, config.package.release, config.package.arch,
@@ -293,6 +299,16 @@ fn cmd_plan(
     for (idx, fmt) in formats.iter().enumerate() {
         if formats.len() > 1 && idx > 0 {
             println!();
+        }
+
+        let dep_format = match *fmt {
+            "rpm" => DepFormat::Rpm,
+            "deb" => DepFormat::Deb,
+            _ => unreachable!(),
+        };
+        let dep_errors = deps::validate_all_deps(&config.package.dependencies, dep_format);
+        if !dep_errors.is_empty() {
+            anyhow::bail!("invalid {fmt} dependencies:\n  {}", dep_errors.join("\n  "));
         }
 
         let limits = match *fmt {
@@ -460,6 +476,16 @@ fn cmd_build(
     let mut build_results: Vec<BuildResult> = Vec::new();
 
     for fmt in &formats {
+        let dep_format = match *fmt {
+            "rpm" => DepFormat::Rpm,
+            "deb" => DepFormat::Deb,
+            _ => unreachable!(),
+        };
+        let dep_errors = deps::validate_all_deps(&config.package.dependencies, dep_format);
+        if !dep_errors.is_empty() {
+            anyhow::bail!("invalid {fmt} dependencies:\n  {}", dep_errors.join("\n  "));
+        }
+
         let limits = match *fmt {
             "rpm" => FormatLimits::rpm(),
             "deb" => FormatLimits::deb(),

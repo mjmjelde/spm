@@ -2,6 +2,7 @@
 
 pub mod alternatives;
 pub mod config;
+pub mod deps;
 pub mod distro;
 pub mod error;
 pub mod filetree;

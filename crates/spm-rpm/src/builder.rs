@@ -97,6 +97,9 @@ impl RpmBuilder {
         }
         prog.stage_finish(BuildStage::WritingPayload);
 
+        // 2b. Compute SHA-256 digest of the compressed payload.
+        let payload_digest = sha256_file(payload_tmp.path())?;
+
         // 3. Build metadata header.
         prog.stage_start(BuildStage::BuildingMetadata, 0, 0);
         let header_bytes = build_metadata_header(
@@ -107,6 +110,7 @@ impl RpmBuilder {
             &algorithm,
             target_distro,
             &inode_map,
+            &payload_digest,
         )?;
         prog.stage_finish(BuildStage::BuildingMetadata);
 
@@ -158,10 +162,15 @@ fn build_metadata_header(
     algorithm: &Algorithm,
     target_distro: Option<&Distro>,
     inode_map: &InodeMap,
+    payload_digest: &str,
 ) -> Result<Vec<u8>, RpmError> {
     let mut hdr = HeaderBuilder::new();
 
     add_package_metadata(&mut hdr, plan, sub_package, config, algorithm)?;
+
+    // Payload digest (RPM 4.14+ — required for EL10/RPM 4.19+ verification).
+    hdr.add_string_array(RPMTAG_PAYLOADDIGEST, vec![payload_digest.to_owned()]);
+    hdr.add_int32(RPMTAG_PAYLOADDIGESTALGO, vec![PGPHASHALGO_SHA256 as i32]);
 
     if !sub_package.files.is_empty() {
         add_file_metadata(
